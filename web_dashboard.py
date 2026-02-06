@@ -170,7 +170,9 @@ class WebDashboard:
             'total_healed': self.orchestrator.total_healed,
             'failed_healings': self.orchestrator.total_failed_healings,
             'total_quarantines': self.orchestrator.quarantine.total_quarantines,
-            'success_rate': self.orchestrator.immune_memory.get_success_rate(),
+            'current_quarantined': self.orchestrator.quarantine.get_quarantined_count(),
+            # Success rate = share of detected infections that were successfully healed
+            'success_rate': (self.orchestrator.total_healed / self.orchestrator.total_infections) if self.orchestrator.total_infections else self.orchestrator.immune_memory.get_success_rate(),
             'immune_records': self.orchestrator.immune_memory.get_total_healings(),
             'learned_patterns': patterns
         })
@@ -264,7 +266,7 @@ HTML_TEMPLATE = """
         
         .stats-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            grid-template-columns: repeat(6, minmax(0, 1fr));
             gap: 15px;
             margin-bottom: 20px;
         }
@@ -890,13 +892,13 @@ HTML_TEMPLATE = """
                 <div class="label">Healed</div>
                 <div class="value" id="stat-healed">-</div>
             </div>
+            <div class="stat-card" title="Total quarantine events (1 per infection). Less than Healed when some are still pending or run ended before healing.">
+                <div class="label">Quarantined</div>
+                <div class="value" id="stat-quarantined">-</div>
+            </div>
             <div class="stat-card">
                 <div class="label">Success Rate</div>
                 <div class="value" id="stat-success">-</div>
-            </div>
-            <div class="stat-card">
-                <div class="label">Runtime</div>
-                <div class="value" id="stat-runtime">-</div>
             </div>
         </div>
         
@@ -904,7 +906,7 @@ HTML_TEMPLATE = """
             ⏳ Healing in progress: <span id="healing-progress-agents"></span>
         </div>
         
-        <div class="section collapsible" id="pending-approvals-section">
+        <div class="section collapsible collapsed" id="pending-approvals-section">
             <div class="section-header-toggle">
                 <h2>⏸️ Pending Approvals (severe infections)</h2>
                 <span class="section-arrow">▼</span>
@@ -919,7 +921,7 @@ HTML_TEMPLATE = """
             </div>
         </div>
         
-        <div class="section collapsible" id="rejected-approvals-section">
+        <div class="section collapsible collapsed" id="rejected-approvals-section">
             <div class="section-header-toggle">
                 <h2>🚫 Rejected Healings</h2>
                 <span class="section-arrow">▼</span>
@@ -1004,11 +1006,14 @@ HTML_TEMPLATE = """
         function updatePendingApprovals(list) {
             const container = document.getElementById('pending-approvals-list');
             const actionsRow = document.getElementById('pending-actions-row');
+            const section = document.getElementById('pending-approvals-section');
             if (!list || list.length === 0) {
                 if (actionsRow) actionsRow.style.display = 'none';
                 container.innerHTML = '<div class="empty-state">No pending approvals</div>';
+                if (section) section.classList.add('collapsed');
                 return;
             }
+            if (section) section.classList.remove('collapsed');
             if (actionsRow) actionsRow.style.display = 'flex';
             container.innerHTML = list.map(p => `
                 <div class="pending-approval-card" data-agent-id="${p.agent_id}">
@@ -1019,7 +1024,7 @@ HTML_TEMPLATE = """
                         <div class="meta" style="margin-top: 4px;">${p.reasoning}</div>
                     </div>
                     <div class="pending-approval-actions">
-                        <button class="btn-approve" data-tooltip="Approve" onclick="approveHealing('${p.agent_id}', true)" title="Approve healing">✓</button>
+                        <button class="btn-approve" data-tooltip="Heal" onclick="approveHealing('${p.agent_id}', true)" title="Heal">✓</button>
                         <button class="btn-reject" data-tooltip="Reject" onclick="approveHealing('${p.agent_id}', false)" title="Reject healing">✗</button>
                     </div>
                 </div>
@@ -1045,11 +1050,14 @@ HTML_TEMPLATE = """
         function updateRejectedApprovals(list) {
             const container = document.getElementById('rejected-approvals-list');
             const actionsRow = document.getElementById('rejected-actions-row');
+            const section = document.getElementById('rejected-approvals-section');
             if (!list || list.length === 0) {
                 if (actionsRow) actionsRow.style.display = 'none';
                 container.innerHTML = '<div class="empty-state">No rejected healings</div>';
+                if (section) section.classList.add('collapsed');
                 return;
             }
+            if (section) section.classList.remove('collapsed');
             if (actionsRow) actionsRow.style.display = 'flex';
             container.innerHTML = list.map(p => `
                 <div class="pending-approval-card rejected-card">
@@ -1084,11 +1092,8 @@ HTML_TEMPLATE = """
             document.getElementById('stat-executions').textContent = stats.total_executions;
             document.getElementById('stat-infections').textContent = stats.total_infections;
             document.getElementById('stat-healed').textContent = stats.total_healed;
+            document.getElementById('stat-quarantined').textContent = stats.total_quarantines;
             document.getElementById('stat-success').textContent = (stats.success_rate * 100).toFixed(0) + '%';
-            
-            const runtimeSec = (stats.runtime != null) ? Math.floor(stats.runtime) : 0;
-            document.getElementById('stat-runtime').textContent = runtimeSec + 's';
-            // Subtitle is never overwritten; it stays as the original description.
         }
         
         function updateAgents(agents, healingInProgress) {
@@ -1103,7 +1108,7 @@ HTML_TEMPLATE = """
                     ? `<div class="agent-card-pending-block">
                         <span class="pending-label">Action required</span>
                         <div class="pending-actions">
-                            <button type="button" class="btn-approve-inline" data-approve="true" data-tooltip="Approve" title="Approve healing">✓</button>
+                            <button type="button" class="btn-approve-inline" data-approve="true" data-tooltip="Heal" title="Heal">✓</button>
                             <button type="button" class="btn-reject-inline" data-approve="false" data-tooltip="Reject" title="Reject healing">✗</button>
                         </div>
                        </div>`

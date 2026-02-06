@@ -18,7 +18,6 @@ from web_dashboard import WebDashboard
 async def main():
     """Main entry point with web dashboard"""
     print("Starting AI Agent Immune System...", flush=True)
-    
     # Create pool of 15 diverse agents
     agents = create_agent_pool(15)
     print(f"Created {len(agents)} agents", flush=True)
@@ -31,7 +30,7 @@ async def main():
     dashboard.set_loop(asyncio.get_running_loop())
     dashboard.start()
 
-    # Run for 2 minutes (120 seconds) - adjust as needed
+    # Run for 1200 seconds - adjust as needed
     await orchestrator.run(duration_seconds=1200)
 
 

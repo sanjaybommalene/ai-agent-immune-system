@@ -26,7 +26,10 @@ TICK_INTERVAL_SECONDS = 1.0
 SEVERITY_REQUIRING_APPROVAL = 7.0
 
 # Delay between healing steps so UI can show "healing in progress"
-HEALING_STEP_DELAY_SECONDS = 2.5
+HEALING_STEP_DELAY_SECONDS = 1.5
+
+# Max time to wait for all quarantined agents to be healed before shutdown
+DRAIN_TIMEOUT_SECONDS = 120
 
 
 # ANSI Color codes for terminal output
@@ -59,7 +62,7 @@ class ImmuneSystemOrchestrator:
         
         # Initialize components
         self.telemetry = TelemetryCollector()
-        self.baseline_learner = BaselineLearner(min_samples=20)
+        self.baseline_learner = BaselineLearner(min_samples=15)
         self.sentinel = Sentinel(threshold_stddev=2.5)
         self.diagnostician = Diagnostician()
         self.quarantine = QuarantineController()
@@ -371,24 +374,40 @@ class ImmuneSystemOrchestrator:
         finally:
             self.healing_in_progress.discard(agent_id)
     
-    async def chaos_injection_schedule(self):
-        """Schedule chaos injections for demo — multiple waves so severe infections appear more often"""
+    async def chaos_injection_schedule(self, duration_seconds: int = 120):
+        """Schedule chaos injections for demo. No new infections in last 5 sec so drain can reach 100% success."""
+        no_inject_after = self.start_time + max(0, duration_seconds - 5)
+        agents_list = list(self.agents.values())
+        
         # Wait for baselines to be learned
         await asyncio.sleep(20)
-        
+        if time.time() >= no_inject_after or not self.running:
+            return
         print_flush(colored("\n💥 CHAOS INJECTION (wave 1) - Simulating failures...\n", Colors.RED + Colors.BOLD))
-        agents_list = list(self.agents.values())
-        results = self.chaos.inject_random_failure(agents_list, count=4)
+        results = self.chaos.inject_random_failure(agents_list, count=5)
         for agent_id, infection_type in results:
             print_flush(colored(f"💉 Injected {infection_type} into {agent_id}", Colors.RED))
         
-        # Second wave after ~40s so more severe infections appear
-        await asyncio.sleep(40)
+        # Second wave
+        await asyncio.sleep(25)
+        if time.time() >= no_inject_after or not self.running:
+            return
         available = [a for a in agents_list if not a.infected]
-        if available and self.running:
+        if available:
             print_flush(colored("\n💥 CHAOS INJECTION (wave 2) - More failures...\n", Colors.RED + Colors.BOLD))
-            wave2 = self.chaos.inject_random_failure(available, count=min(3, len(available)))
+            wave2 = self.chaos.inject_random_failure(available, count=min(4, len(available)))
             for agent_id, infection_type in wave2:
+                print_flush(colored(f"💉 Injected {infection_type} into {agent_id}", Colors.RED))
+        
+        # Third wave — more chances for pending approvals
+        await asyncio.sleep(25)
+        if time.time() >= no_inject_after or not self.running:
+            return
+        available = [a for a in agents_list if not a.infected]
+        if available:
+            print_flush(colored("\n💥 CHAOS INJECTION (wave 3) - More failures...\n", Colors.RED + Colors.BOLD))
+            wave3 = self.chaos.inject_random_failure(available, count=min(4, len(available)))
+            for agent_id, infection_type in wave3:
                 print_flush(colored(f"💉 Injected {infection_type} into {agent_id}", Colors.RED))
     
     def print_summary(self):
@@ -408,8 +427,11 @@ class ImmuneSystemOrchestrator:
         print(f"{'Total Infections Detected':<35} {self.total_infections}")
         print(f"{'Successfully Healed':<35} {self.total_healed}")
         print(f"{'Failed Healing Attempts':<35} {self.total_failed_healings}")
-        print(f"{'Total Quarantines':<35} {self.quarantine.total_quarantines}")
-        print(f"{'Healing Success Rate':<35} {self.immune_memory.get_success_rate():.1%}")
+        print(f"{'Total Quarantine Events':<35} {self.quarantine.total_quarantines}")
+        print(f"{'Currently in Quarantine':<35} {self.quarantine.get_quarantined_count()}")
+        # Success rate = share of detected infections that were successfully healed
+        resolution_rate = (self.total_healed / self.total_infections) if self.total_infections else 0.0
+        print(f"{'Healing Success Rate':<35} {resolution_rate:.1%}")
         print(f"{'Immune Memory Records':<35} {self.immune_memory.get_total_healings()}")
         
         # Print learned patterns
@@ -435,11 +457,30 @@ class ImmuneSystemOrchestrator:
         # Start sentinel
         sentinel_task = asyncio.create_task(self.sentinel_loop())
         
-        # Start chaos injection
-        chaos_task = asyncio.create_task(self.chaos_injection_schedule())
+        # Start chaos injection (no new infections in last 5 sec)
+        chaos_task = asyncio.create_task(self.chaos_injection_schedule(duration_seconds))
         
         # Run for specified duration
         await asyncio.sleep(duration_seconds)
+        
+        # Drain: heal all quarantined so success rate can reach 100% before closing
+        print_flush(colored("\n📋 Draining: healing all quarantined agents before shutdown...", Colors.CYAN + Colors.BOLD))
+        drain_tasks = []
+        approved_list = self.approve_all_pending(True)
+        for agent_id, infection in approved_list:
+            drain_tasks.append(asyncio.create_task(self.heal_agent(agent_id, infection, "drain_approve")))
+        rejected_list = self.start_healing_all_rejected()
+        for agent_id, infection in rejected_list:
+            drain_tasks.append(asyncio.create_task(self.heal_agent(agent_id, infection, "drain_heal_now")))
+        if drain_tasks:
+            await asyncio.gather(*drain_tasks)
+        deadline = time.time() + DRAIN_TIMEOUT_SECONDS
+        while self.healing_in_progress and time.time() < deadline:
+            await asyncio.sleep(0.5)
+        if self.healing_in_progress:
+            print_flush(colored("⚠️ Drain timeout: some healing still in progress", Colors.YELLOW))
+        else:
+            print_flush(colored("✅ All quarantined agents healed", Colors.GREEN + Colors.BOLD))
         
         # Shutdown
         self.running = False

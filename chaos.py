@@ -42,7 +42,7 @@ class ChaosInjector:
             ("memory_corruption", "MEMORY CORRUPTION"),
             ("full_meltdown", "FULL MELTDOWN"),
         ]
-        # Severe types (multi-signal or very high deviation) — pick these ~40% of the time
+        # Severe types (multi-signal or very high deviation) — pick these ~70% of the time for more pending approvals
         severe_types = [
             ("prompt_drift", "PROMPT DRIFT"),
             ("memory_corruption", "MEMORY CORRUPTION"),
@@ -56,7 +56,7 @@ class ChaosInjector:
         targets = random.sample(available, count)
         results = []
         for agent in targets:
-            if severe_types and random.random() < 0.4:
+            if severe_types and random.random() < 0.7:
                 infection_type, name = random.choice(severe_types)
             else:
                 infection_type, name = random.choice(infection_types)

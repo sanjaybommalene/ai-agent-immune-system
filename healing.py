@@ -134,7 +134,7 @@ class Healer:
             agent.cure()
             
             # Wait for a few executions to validate (need more time for behavior to normalize)
-            await asyncio.sleep(4)
+            await asyncio.sleep(1.5)
             
             # Validate healing worked
             validation_passed = await self._validate_healing(agent)
