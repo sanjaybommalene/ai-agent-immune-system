@@ -30,7 +30,8 @@ class ImmuneMemory:
     Key principle: NEVER repeat failed actions for the same diagnosis
     """
     
-    def __init__(self):
+    def __init__(self, store=None):
+        self.store = store
         # Store all healing records
         self.records: List[HealingRecord] = []
         
@@ -51,6 +52,18 @@ class ImmuneMemory:
             healing_action: Action that was attempted
             success: Whether healing succeeded
         """
+        if self.store:
+            self.store.write_healing_event(
+                agent_id=agent_id,
+                diagnosis_type=diagnosis_type.value,
+                healing_action=healing_action.value,
+                success=success,
+                validation_passed=success,
+                trigger="memory_record",
+                message=None,
+            )
+            return
+
         record = HealingRecord(
             agent_id=agent_id,
             diagnosis_type=diagnosis_type,
@@ -79,6 +92,16 @@ class ImmuneMemory:
         Returns:
             Set of HealingActions that failed before
         """
+        if self.store:
+            raw_actions = self.store.get_failed_healing_actions(agent_id, diagnosis_type.value)
+            out = set()
+            for action in raw_actions:
+                try:
+                    out.add(HealingAction(action))
+                except ValueError:
+                    continue
+            return out
+
         records = self.by_agent_diagnosis.get((agent_id, diagnosis_type), [])
         
         failed_actions = set()
@@ -112,10 +135,14 @@ class ImmuneMemory:
     
     def get_total_healings(self) -> int:
         """Get total number of healing attempts"""
+        if self.store:
+            return self.store.get_total_healings()
         return len(self.records)
     
     def get_success_rate(self) -> float:
         """Get overall healing success rate"""
+        if self.store:
+            return self.store.get_healing_success_rate()
         if not self.records:
             return 0.0
         
@@ -124,6 +151,8 @@ class ImmuneMemory:
     
     def get_pattern_summary(self) -> Dict:
         """Get summary of learned patterns"""
+        if self.store:
+            return self.store.get_healing_pattern_summary()
         summary = {}
         
         for diagnosis_type, actions in self.global_success_patterns.items():
@@ -138,4 +167,6 @@ class ImmuneMemory:
     
     def has_learning_for(self, agent_id: str, diagnosis_type: DiagnosisType) -> bool:
         """Check if we have any learning for this agent + diagnosis combination"""
+        if self.store:
+            return len(self.store.get_failed_healing_actions(agent_id, diagnosis_type.value)) > 0
         return (agent_id, diagnosis_type) in self.by_agent_diagnosis

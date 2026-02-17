@@ -163,13 +163,15 @@ class WebDashboard:
         """Get overall statistics"""
         patterns = self.orchestrator.immune_memory.get_pattern_summary()
         runtime_seconds = time.time() - self.orchestrator.start_time
+        current_infected = sum(1 for agent in self.orchestrator.agents.values() if agent.infected)
         
         return jsonify({
             'total_agents': len(self.orchestrator.agents),
             'total_executions': self.orchestrator.telemetry.total_executions,
             'runtime': runtime_seconds,
-            'baselines_learned': len(self.orchestrator.baseline_learner.baselines),
+            'baselines_learned': self.orchestrator.baseline_learner.count_baselines(),
             'total_infections': self.orchestrator.total_infections,
+            'current_infected': current_infected,
             'total_healed': self.orchestrator.total_healed,
             'failed_healings': self.orchestrator.total_failed_healings,
             'total_quarantines': self.orchestrator.quarantine.total_quarantines,
@@ -1092,7 +1094,7 @@ HTML_TEMPLATE = """
         function updateStats(stats) {
             document.getElementById('stat-agents').textContent = stats.total_agents;
             document.getElementById('stat-executions').textContent = stats.total_executions;
-            document.getElementById('stat-infections').textContent = stats.total_infections;
+            document.getElementById('stat-infections').textContent = (stats.current_infected ?? stats.total_infections);
             document.getElementById('stat-healed').textContent = stats.total_healed;
             document.getElementById('stat-quarantined').textContent = stats.total_quarantines;
             document.getElementById('stat-success').textContent = (stats.success_rate * 100).toFixed(0) + '%';
