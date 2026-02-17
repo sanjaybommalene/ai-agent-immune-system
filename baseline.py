@@ -2,7 +2,7 @@
 Baseline Learning - Learn normal behavior for each agent
 """
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Dict, List, Optional
 import statistics
 
 
@@ -38,8 +38,9 @@ class BaselineProfile:
 class BaselineLearner:
     """Learns baseline behavior for agents"""
     
-    def __init__(self, min_samples: int = 20):
+    def __init__(self, min_samples: int = 20, store=None):
         self.min_samples = min_samples
+        self.store = store
         self.baselines: Dict[str, BaselineProfile] = {}
     
     def learn_baseline(self, agent_id: str, vitals_list: List) -> BaselineProfile:
@@ -68,6 +69,22 @@ class BaselineLearner:
         )
         
         self.baselines[agent_id] = baseline
+        if self.store:
+            self.store.write_baseline_profile(
+                {
+                    "agent_id": baseline.agent_id,
+                    "latency_mean": baseline.latency_mean,
+                    "latency_stddev": baseline.latency_stddev,
+                    "latency_p95": baseline.latency_p95,
+                    "tokens_mean": baseline.tokens_mean,
+                    "tokens_stddev": baseline.tokens_stddev,
+                    "tokens_p95": baseline.tokens_p95,
+                    "tools_mean": baseline.tools_mean,
+                    "tools_stddev": baseline.tools_stddev,
+                    "tools_p95": baseline.tools_p95,
+                    "sample_size": baseline.sample_size,
+                }
+            )
         return baseline
     
     def is_baseline_ready(self, agent_id: str, current_count: int) -> bool:
@@ -76,11 +93,34 @@ class BaselineLearner:
     
     def get_baseline(self, agent_id: str) -> BaselineProfile:
         """Get baseline for an agent"""
+        if agent_id in self.baselines:
+            return self.baselines[agent_id]
+        if self.store:
+            raw = self.store.get_baseline_profile(agent_id)
+            if raw:
+                baseline = BaselineProfile(**raw)
+                self.baselines[agent_id] = baseline
+                return baseline
         return self.baselines.get(agent_id)
     
     def has_baseline(self, agent_id: str) -> bool:
         """Check if baseline exists for agent"""
+        if agent_id in self.baselines:
+            return True
+        if self.store:
+            raw = self.store.get_baseline_profile(agent_id)
+            if raw:
+                self.baselines[agent_id] = BaselineProfile(**raw)
+                return True
         return agent_id in self.baselines
+
+    def count_baselines(self) -> int:
+        """Get baseline count across the fleet."""
+        if self.baselines:
+            return len(self.baselines)
+        if self.store:
+            return self.store.count_baselines()
+        return len(self.baselines)
     
     @staticmethod
     def _percentile(data: List[float], percentile: int) -> float:

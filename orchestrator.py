@@ -5,9 +5,10 @@ import asyncio
 import threading
 from typing import List, Dict, Any, Optional, Tuple
 import time
+from opentelemetry import metrics
 
 from agents import BaseAgent
-from detection import InfectionReport
+from detection import InfectionReport, AnomalyType
 from telemetry import TelemetryCollector
 from baseline import BaselineLearner
 from detection import Sentinel
@@ -38,16 +39,17 @@ DRAIN_TIMEOUT_SECONDS = 120
 class ImmuneSystemOrchestrator:
     """Coordinates all immune system components"""
     
-    def __init__(self, agents: List[BaseAgent]):
+    def __init__(self, agents: List[BaseAgent], store=None):
         self.agents = {agent.agent_id: agent for agent in agents}
+        self.store = store
         
         # Initialize components
-        self.telemetry = TelemetryCollector()
-        self.baseline_learner = BaselineLearner(min_samples=15)
+        self.telemetry = TelemetryCollector(store=store)
+        self.baseline_learner = BaselineLearner(min_samples=15, store=store)
         self.sentinel = Sentinel(threshold_stddev=2.5)
         self.diagnostician = Diagnostician()
         self.quarantine = QuarantineController()
-        self.immune_memory = ImmuneMemory()
+        self.immune_memory = ImmuneMemory(store=store)
         self.healer = Healer(self.telemetry, self.baseline_learner, self.sentinel)
         self.chaos = ChaosInjector()
         
@@ -61,22 +63,30 @@ class ImmuneSystemOrchestrator:
         self.running = True
         self.baselines_learned = False
 
-        # Severe infections awaiting UI approval (agent_id -> {infection, diagnosis, requested_at})
+        # In-memory workflow state is fallback only when store is not configured.
         self._pending_approvals: Dict[str, Dict[str, Any]] = {}
-        # Rejected approvals: agent stays quarantined until user clicks "Heal now"
         self._rejected_approvals: Dict[str, Dict[str, Any]] = {}
         self._pending_lock = threading.Lock()
+        self._workflow_lock = threading.Lock()
 
         # Agents currently in heal_agent() for UI "healing in progress" display
         self.healing_in_progress: set = set()
 
-        # Unified log of user/system healing actions for "Recent Healing Actions" UI
+        # Unified log of user/system healing actions for "Recent Healing Actions" UI (fallback mode).
         self._healing_action_log: List[Dict[str, Any]] = []
         self._action_log_max = 80
         self._action_log_lock = threading.Lock()
 
+        meter = metrics.get_meter("immune-system.orchestrator")
+        self._infection_counter = meter.create_counter("immune.infection.detected")
+        self._approval_counter = meter.create_counter("immune.approval.events")
+        self._quarantine_counter = meter.create_counter("immune.quarantine.events")
+
     def _log_action(self, action_type: str, agent_id: str, **kwargs):
         """Append a healing action for the UI (thread-safe)."""
+        if self.store:
+            self.store.write_action_log(action_type=action_type, agent_id=agent_id, payload=kwargs)
+            return
         entry = {'type': action_type, 'agent_id': agent_id, 'timestamp': time.time(), **kwargs}
         with self._action_log_lock:
             self._healing_action_log.append(entry)
@@ -85,8 +95,91 @@ class ImmuneSystemOrchestrator:
 
     def get_healing_actions(self) -> List[Dict[str, Any]]:
         """Return recent healing actions (user + system) for UI (thread-safe)."""
+        if self.store:
+            return self.store.get_recent_actions(limit=50)
         with self._action_log_lock:
             return list(self._healing_action_log[-50:])
+
+    @staticmethod
+    def _serialize_infection(infection: InfectionReport) -> Dict[str, Any]:
+        return {
+            "agent_id": infection.agent_id,
+            "severity": infection.severity,
+            "anomalies": [a.value for a in infection.anomalies],
+            "deviations": infection.deviations,
+        }
+
+    def _infection_from_payload(self, agent_id: str, payload: Dict[str, Any], fallback: Optional[Dict[str, Any]] = None) -> InfectionReport:
+        from detection import AnomalyType
+
+        base = payload or {}
+        if not base and fallback:
+            base = {
+                "severity": fallback.get("severity", 0.0),
+                "anomalies": fallback.get("anomalies", []),
+                "deviations": {},
+            }
+
+        anomaly_values = base.get("anomalies", [])
+        anomalies = []
+        for item in anomaly_values:
+            try:
+                anomalies.append(AnomalyType(item))
+            except ValueError:
+                continue
+
+        return InfectionReport(
+            agent_id=agent_id,
+            severity=float(base.get("severity", 0.0) or 0.0),
+            anomalies=anomalies,
+            deviations=base.get("deviations", {}) or {},
+        )
+
+    def _release_quarantine(self, agent: BaseAgent):
+        agent_id = agent.agent_id
+        duration = self.quarantine.get_quarantine_duration(agent_id)
+        self.quarantine.release(agent_id)
+        agent.release()
+        self._quarantine_counter.add(1, attributes={"agent_id": agent_id, "action": "release"})
+        if self.store:
+            self.store.write_quarantine_event(agent_id=agent_id, action="release", duration_s=duration)
+
+    @staticmethod
+    def _fallback_infection_from_agent_state(agent: BaseAgent) -> Optional[InfectionReport]:
+        """Fallback for demo mode: avoid agents staying forever in INFECTED state."""
+        if not agent.infected:
+            return None
+
+        infection_type = (agent.infection_type or "").lower()
+        anomalies: List[AnomalyType]
+        severity: float
+
+        if infection_type in ("token_explosion", "prompt_drift"):
+            anomalies = [AnomalyType.TOKEN_SPIKE]
+            severity = 7.2 if infection_type == "prompt_drift" else 6.8
+        elif infection_type == "tool_loop":
+            anomalies = [AnomalyType.TOOL_EXPLOSION]
+            severity = 7.0
+        elif infection_type == "latency_spike":
+            anomalies = [AnomalyType.LATENCY_SPIKE]
+            severity = 6.5
+        elif infection_type in ("high_retry_rate", "memory_corruption"):
+            anomalies = [AnomalyType.HIGH_RETRY_RATE]
+            severity = 6.7 if infection_type == "memory_corruption" else 6.2
+        elif infection_type == "full_meltdown":
+            anomalies = [
+                AnomalyType.LATENCY_SPIKE,
+                AnomalyType.TOKEN_SPIKE,
+                AnomalyType.TOOL_EXPLOSION,
+                AnomalyType.HIGH_RETRY_RATE,
+            ]
+            severity = 9.0
+        else:
+            anomalies = [AnomalyType.HIGH_RETRY_RATE]
+            severity = 6.0
+
+        deviations = {a.value: severity for a in anomalies}
+        return InfectionReport(agent_id=agent.agent_id, severity=severity, anomalies=anomalies, deviations=deviations)
     
     async def run_agent_loop(self, agent: BaseAgent):
         """Continuously run an agent and emit telemetry on a 1s tick (synced with UI poll)."""
@@ -126,27 +219,44 @@ class ImmuneSystemOrchestrator:
                 # Skip if already quarantined
                 if self.quarantine.is_quarantined(agent_id):
                     continue
-                
-                # Skip if no baseline yet
-                if not self.baseline_learner.has_baseline(agent_id):
-                    continue
-                
-                # Get recent telemetry
-                recent = self.telemetry.get_recent(agent_id, window_seconds=10)
-                if not recent:
-                    continue
-                
-                # Check for infection
                 baseline = self.baseline_learner.get_baseline(agent_id)
-                infection = self.sentinel.detect_infection(recent, baseline)
+
+                # If runtime marks agent infected, force containment path immediately.
+                # This prevents demo agents from lingering in INFECTED state.
+                if agent.infected:
+                    infection = self._fallback_infection_from_agent_state(agent)
+                else:
+                    # Skip non-infected agents until baseline exists.
+                    if not self.baseline_learner.has_baseline(agent_id):
+                        continue
+
+                    # Get recent telemetry
+                    recent = self.telemetry.get_recent(agent_id, window_seconds=10)
+                    if not recent:
+                        continue
+
+                    # Statistical anomaly detection for healthy runtime state.
+                    infection = self.sentinel.detect_infection(recent, baseline)
                 
                 if infection:
                     # Skip if user previously rejected healing — wait for "Heal now"
-                    with self._pending_lock:
-                        if agent_id in self._rejected_approvals:
+                    if self.store:
+                        latest_state = self.store.get_latest_approval_state(agent_id)
+                        if latest_state and latest_state.get("decision") == "rejected":
                             continue
+                    else:
+                        with self._pending_lock:
+                            if agent_id in self._rejected_approvals:
+                                continue
 
                     self.total_infections += 1
+                    self._infection_counter.add(
+                        1,
+                        attributes={
+                            "agent_id": agent_id,
+                            "severity_band": "severe" if infection.severity >= SEVERITY_REQUIRING_APPROVAL else "mild",
+                        },
+                    )
 
                     anomaly_names = ", ".join(a.value for a in infection.anomalies)
                     logger.warning(
@@ -157,17 +267,40 @@ class ImmuneSystemOrchestrator:
                     # Quarantine immediately
                     self.quarantine.quarantine(agent_id)
                     agent.quarantine()
+                    self._quarantine_counter.add(1, attributes={"agent_id": agent_id, "action": "enter"})
+                    if self.store:
+                        self.store.write_quarantine_event(agent_id=agent_id, action="enter")
                     logger.warning("Agent %s QUARANTINED", agent_id)
 
                     # Severe infections require UI approval before healing
                     if infection.severity >= SEVERITY_REQUIRING_APPROVAL:
                         diagnosis = self.diagnostician.diagnose(infection, baseline)
-                        with self._pending_lock:
-                            self._pending_approvals[agent_id] = {
-                                'infection': infection,
-                                'diagnosis': diagnosis,
-                                'requested_at': time.time()
-                            }
+                        if self.store:
+                            payload = self._serialize_infection(infection)
+                            self.store.write_infection_event(
+                                agent_id=agent_id,
+                                severity=infection.severity,
+                                anomalies=payload["anomalies"],
+                                deviations=payload["deviations"],
+                                diagnosis_type=diagnosis.diagnosis_type.value,
+                            )
+                            self.store.write_approval_event(
+                                agent_id=agent_id,
+                                decision="pending",
+                                severity=infection.severity,
+                                anomalies=payload["anomalies"],
+                                diagnosis_type=diagnosis.diagnosis_type.value,
+                                reasoning=diagnosis.reasoning,
+                                infection_payload=payload,
+                            )
+                        else:
+                            with self._pending_lock:
+                                self._pending_approvals[agent_id] = {
+                                    'infection': infection,
+                                    'diagnosis': diagnosis,
+                                    'requested_at': time.time()
+                                }
+                        self._approval_counter.add(1, attributes={"decision": "requested", "agent_id": agent_id})
                         self._log_action("approval_requested", agent_id, severity=round(infection.severity, 1))
                         logger.info(
                             "Agent %s requires approval (severity %.1f) - use dashboard to Approve/Reject",
@@ -182,6 +315,8 @@ class ImmuneSystemOrchestrator:
     
     def get_pending_approvals(self) -> List[Dict[str, Any]]:
         """Return list of severe infections awaiting UI approval (thread-safe)."""
+        if self.store:
+            return self.store.get_pending_approvals()
         with self._pending_lock:
             out = []
             for agent_id, data in self._pending_approvals.items():
@@ -203,6 +338,43 @@ class ImmuneSystemOrchestrator:
         Returns (infection, approved). If approved, caller should schedule heal_agent(agent_id, infection).
         If rejected, agent stays quarantined until user clicks "Heal now".
         """
+        if self.store:
+            with self._workflow_lock:
+                latest = self.store.get_latest_approval_state(agent_id)
+                if not latest or latest.get("decision") != "pending":
+                    return None, False
+
+                infection_payload = latest.get("infection_payload", {})
+                infection = self._infection_from_payload(agent_id, infection_payload, fallback=latest)
+
+                if approved:
+                    self._approval_counter.add(1, attributes={"decision": "approved", "agent_id": agent_id})
+                    self._log_action("user_approved", agent_id)
+                    self.store.write_approval_event(
+                        agent_id=agent_id,
+                        decision="approved",
+                        severity=latest.get("severity"),
+                        anomalies=latest.get("anomalies"),
+                        diagnosis_type=latest.get("diagnosis_type"),
+                        reasoning=latest.get("reasoning"),
+                        infection_payload=infection_payload,
+                    )
+                    return infection, True
+
+                self._approval_counter.add(1, attributes={"decision": "rejected", "agent_id": agent_id})
+                self._log_action("user_rejected", agent_id)
+                self.store.write_approval_event(
+                    agent_id=agent_id,
+                    decision="rejected",
+                    severity=latest.get("severity"),
+                    anomalies=latest.get("anomalies"),
+                    diagnosis_type=latest.get("diagnosis_type"),
+                    reasoning=latest.get("reasoning"),
+                    infection_payload=infection_payload,
+                )
+                logger.info("Healing rejected for %s - quarantined until 'Heal now'", agent_id)
+                return None, False
+
         with self._pending_lock:
             entry = self._pending_approvals.pop(agent_id, None)
         if not entry:
@@ -228,8 +400,11 @@ class ImmuneSystemOrchestrator:
         Approve or reject all pending approvals (thread-safe).
         Returns list of (agent_id, infection) for approved ones so caller can schedule heal_agent for each.
         """
-        with self._pending_lock:
-            agent_ids = list(self._pending_approvals.keys())
+        if self.store:
+            agent_ids = [item["agent_id"] for item in self.store.get_pending_approvals()]
+        else:
+            with self._pending_lock:
+                agent_ids = list(self._pending_approvals.keys())
         approved_list = []
         for agent_id in agent_ids:
             infection, did_approve = self.approve_healing(agent_id, approved)
@@ -239,6 +414,8 @@ class ImmuneSystemOrchestrator:
 
     def get_rejected_approvals(self) -> List[Dict[str, Any]]:
         """Return list of agents whose healing was rejected (thread-safe)."""
+        if self.store:
+            return self.store.get_rejected_approvals()
         with self._pending_lock:
             out = []
             for agent_id, data in self._rejected_approvals.items():
@@ -260,6 +437,27 @@ class ImmuneSystemOrchestrator:
         Removes from rejected and returns the stored infection so caller can schedule heal_agent.
         Returns None if agent was not in rejected_approvals.
         """
+        if self.store:
+            with self._workflow_lock:
+                latest = self.store.get_latest_approval_state(agent_id)
+                if not latest or latest.get("decision") != "rejected":
+                    return None
+                infection_payload = latest.get("infection_payload", {})
+                infection = self._infection_from_payload(agent_id, infection_payload, fallback=latest)
+                self._approval_counter.add(1, attributes={"decision": "heal_now", "agent_id": agent_id})
+                self.store.write_approval_event(
+                    agent_id=agent_id,
+                    decision="heal_now",
+                    severity=latest.get("severity"),
+                    anomalies=latest.get("anomalies"),
+                    diagnosis_type=latest.get("diagnosis_type"),
+                    reasoning=latest.get("reasoning"),
+                    infection_payload=infection_payload,
+                )
+                self._log_action("explicit_heal_requested", agent_id)
+                logger.info("%s - healing started (Heal now)", agent_id)
+                return infection
+
         with self._pending_lock:
             entry = self._rejected_approvals.pop(agent_id, None)
         if not entry:
@@ -274,8 +472,11 @@ class ImmuneSystemOrchestrator:
         Start healing for all rejected agents (thread-safe).
         Removes all from rejected and returns list of (agent_id, infection) so caller can schedule heal_agent for each.
         """
-        with self._pending_lock:
-            agent_ids = list(self._rejected_approvals.keys())
+        if self.store:
+            agent_ids = [item["agent_id"] for item in self.store.get_rejected_approvals()]
+        else:
+            with self._pending_lock:
+                agent_ids = list(self._rejected_approvals.keys())
         result = []
         for agent_id in agent_ids:
             infection = self.start_healing_explicitly(agent_id)
@@ -319,8 +520,7 @@ class ImmuneSystemOrchestrator:
 
             if not next_action:
                 logger.error("All healing actions exhausted for %s", agent_id)
-                self.quarantine.release(agent_id)
-                agent.release()
+                self._release_quarantine(agent)
                 return
 
             logger.info("Attempting healing on %s: %s", agent_id, next_action.value)
@@ -344,8 +544,7 @@ class ImmuneSystemOrchestrator:
 
             if result.validation_passed:
                 logger.info("HEALING SUCCESS for %s: %s - released from quarantine", agent_id, result.message)
-                self.quarantine.release(agent_id)
-                agent.release()
+                self._release_quarantine(agent)
                 self.total_healed += 1
             else:
                 logger.warning("HEALING FAILED for %s: %s", agent_id, result.message)
@@ -407,7 +606,7 @@ class ImmuneSystemOrchestrator:
             f"  {'Runtime':<35} {runtime:.1f} seconds",
             f"  {'Total Agents':<35} {len(self.agents)}",
             f"  {'Total Executions':<35} {self.telemetry.total_executions}",
-            f"  {'Baselines Learned':<35} {len(self.baseline_learner.baselines)}",
+            f"  {'Baselines Learned':<35} {self.baseline_learner.count_baselines()}",
             f"  {'Total Infections Detected':<35} {self.total_infections}",
             f"  {'Successfully Healed':<35} {self.total_healed}",
             f"  {'Failed Healing Attempts':<35} {self.total_failed_healings}",
