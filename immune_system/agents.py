@@ -2,11 +2,22 @@
 Agent Runtime - Core agent implementation with state and execution logic
 """
 import asyncio
+import hashlib
 import random
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, List
 import time
+
+# Approximate cost per 1K tokens by model (USD)
+MODEL_COST_PER_1K = {
+    "GPT-5": 0.03,
+    "GPT-4o": 0.005,
+    "Claude Sonnet 4": 0.003,
+    "Claude Opus 4": 0.015,
+    "Claude Sonnet 3.5": 0.003,
+    "Gemini 2.0": 0.00125,
+}
 
 
 class AgentStatus(Enum):
@@ -22,6 +33,7 @@ class AgentState:
     prompt_version: int = 1
     temperature: float = 0.7
     max_tools: int = 5
+    tools_revoked: bool = False
     
     def reset_memory(self):
         """Clear agent's memory"""
@@ -36,6 +48,16 @@ class AgentState:
         """Reduce agent's autonomy"""
         self.temperature = max(0.1, self.temperature * 0.5)
         self.max_tools = max(1, self.max_tools - 2)
+
+    def revoke_tools(self):
+        """Disable tool access for the agent"""
+        self.tools_revoked = True
+        self.max_tools = 0
+
+    def restore_tools(self, max_tools: int = 5):
+        """Re-enable tool access"""
+        self.tools_revoked = False
+        self.max_tools = max_tools
 
 
 class BaseAgent:
@@ -55,35 +77,47 @@ class BaseAgent:
         self.base_tokens = random.randint(1000, 1500)
         self.base_tool_calls = random.randint(2, 4)
         
+        # Stable prompt hash per agent (changes on prompt_drift infection)
+        self._prompt_hash = hashlib.sha256(f"system-prompt-v1-{agent_id}".encode()).hexdigest()[:16]
+        
         # Infection state
         self.infected = False
         self.infection_type = None
     
+    def _estimate_cost(self, total_tokens: int) -> float:
+        rate = MODEL_COST_PER_1K.get(self.model_name, 0.005)
+        return round(total_tokens * rate / 1000.0, 6)
+
     async def execute(self) -> Dict:
         """Execute agent task and return telemetry"""
         start_time = time.time()
         
-        # Simulate work
         await asyncio.sleep(random.uniform(0.1, 0.3))
         
-        # Calculate metrics with some natural variance
         variance = random.uniform(0.8, 1.2)
         
         if self.infected:
-            # Apply infection effects
             latency_ms = self._infected_latency()
-            token_count = self._infected_tokens()
+            input_tokens = self._infected_input_tokens()
+            output_tokens = self._infected_output_tokens()
             tool_calls = self._infected_tool_calls()
             retries = self._infected_retries()
+            error_type = self._infected_error_type()
+            prompt_hash = self._infected_prompt_hash()
         else:
+            total = int(self.base_tokens * variance)
+            input_tokens = int(total * random.uniform(0.55, 0.75))
+            output_tokens = total - input_tokens
             latency_ms = int(self.base_latency_ms * variance)
-            token_count = int(self.base_tokens * variance)
             tool_calls = max(1, int(self.base_tool_calls * variance))
             retries = 1 if random.random() > 0.9 else 0
-        success = random.random() > 0.05  # 95% success rate normally
+            error_type = ""
+            prompt_hash = self._prompt_hash
+
+        token_count = input_tokens + output_tokens
+        success = error_type == "" and random.random() > 0.05
         
         self.execution_count += 1
-        
         elapsed_ms = int((time.time() - start_time) * 1000)
         
         return {
@@ -91,30 +125,44 @@ class BaseAgent:
             'agent_type': self.agent_type,
             'latency_ms': max(elapsed_ms, latency_ms),
             'token_count': token_count,
+            'input_tokens': input_tokens,
+            'output_tokens': output_tokens,
+            'cost': self._estimate_cost(token_count),
             'tool_calls': tool_calls,
             'retries': retries,
             'success': success,
-            'timestamp': time.time()
+            'model': self.model_name,
+            'error_type': error_type,
+            'prompt_hash': prompt_hash,
+            'timestamp': time.time(),
         }
     
     def _infected_latency(self) -> int:
-        """Modified latency when infected (varied so severity spreads 5-10)"""
         if self.infection_type == "latency_spike":
             return self.base_latency_ms * random.randint(3, 7)
         if self.infection_type in ("prompt_drift", "memory_corruption", "full_meltdown"):
             return self.base_latency_ms * random.randint(3, 6)
         return self.base_latency_ms
     
-    def _infected_tokens(self) -> int:
-        """Modified token usage when infected (varied so severity spreads 5-10)"""
-        if self.infection_type == "token_explosion":
-            return self.base_tokens * random.randint(4, 9)
+    def _infected_input_tokens(self) -> int:
+        """Input token inflation (prompt injection / context stuffing)."""
+        base_input = int(self.base_tokens * 0.65)
+        if self.infection_type in ("prompt_injection", "token_explosion"):
+            return base_input * random.randint(5, 10)
         if self.infection_type in ("prompt_drift", "full_meltdown"):
-            return self.base_tokens * random.randint(4, 8)
-        return self.base_tokens
+            return base_input * random.randint(3, 6)
+        return int(base_input * random.uniform(0.8, 1.2))
+
+    def _infected_output_tokens(self) -> int:
+        """Output token inflation (runaway generation)."""
+        base_output = int(self.base_tokens * 0.35)
+        if self.infection_type in ("token_explosion", "full_meltdown"):
+            return base_output * random.randint(5, 12)
+        if self.infection_type == "prompt_drift":
+            return base_output * random.randint(4, 8)
+        return int(base_output * random.uniform(0.8, 1.2))
     
     def _infected_tool_calls(self) -> int:
-        """Modified tool calls when infected (varied so severity spreads 5-10)"""
         if self.infection_type == "tool_loop":
             return self.base_tool_calls * random.randint(5, 11)
         if self.infection_type == "full_meltdown":
@@ -122,12 +170,23 @@ class BaseAgent:
         return self.base_tool_calls
     
     def _infected_retries(self) -> int:
-        """Modified retry behavior when infected (for high_retry_rate / memory_corruption)"""
         if self.infection_type == "high_retry_rate":
-            return 1 if random.random() > 0.25 else 0  # ~75% retries
+            return 1 if random.random() > 0.25 else 0
         if self.infection_type == "memory_corruption":
-            return 1 if random.random() > 0.3 else 0   # ~70% retries
+            return 1 if random.random() > 0.3 else 0
         return 1 if random.random() > 0.9 else 0
+
+    def _infected_error_type(self) -> str:
+        if self.infection_type == "high_retry_rate":
+            return random.choice(["rate_limit", "timeout", ""]) if random.random() > 0.4 else ""
+        if self.infection_type == "memory_corruption":
+            return "content_filter" if random.random() > 0.6 else ""
+        return ""
+
+    def _infected_prompt_hash(self) -> str:
+        if self.infection_type in ("prompt_drift", "prompt_injection"):
+            return hashlib.sha256(f"corrupted-{time.time()}".encode()).hexdigest()[:16]
+        return self._prompt_hash
     
     def infect(self, infection_type: str):
         """Infect the agent with specific problem"""

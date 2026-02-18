@@ -1,15 +1,15 @@
 """
-Sentinel - Anomaly detection system.
+Sentinel — Anomaly detection system.
 
-Deviation is calculated HERE: detect_infection(recent_vitals, baseline) compares
-recent vitals to the agent's baseline (mean/stddev per metric) and produces
-per-metric deviations and an overall severity (0-10). Both recent_vitals and
-baseline can be backed by InfluxDB (or server API store): recent from
-get_recent_agent_vitals(), baseline from get_baseline_profile() (baseline is
-learned from older metric data in the store). See docs/DOCS.md §4.
+Compares recent vitals to the agent's EWMA baseline and flags deviations.
+Uses consistent stddev-based deviation for ALL metrics (including retry/error
+rates).  Severity has been replaced by direct deviation thresholds.
+
+Minimum stddev floor: when stddev == 0 (constant baseline), a floor of 5% of
+the mean is used so that any non-trivial change can still be detected.
 """
-from dataclasses import dataclass
-from typing import List, Optional
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional
 from enum import Enum
 
 
@@ -18,107 +18,125 @@ class AnomalyType(Enum):
     LATENCY_SPIKE = "latency_spike"
     TOOL_EXPLOSION = "tool_explosion"
     HIGH_RETRY_RATE = "high_retry_rate"
+    INPUT_TOKEN_SPIKE = "input_token_spike"
+    OUTPUT_TOKEN_SPIKE = "output_token_spike"
+    COST_SPIKE = "cost_spike"
+    PROMPT_CHANGE = "prompt_change"
+    ERROR_RATE_SPIKE = "error_rate_spike"
+
+# Minimum stddev floor factor — prevents division by zero when baseline
+# has zero variance (constant metric values during learning).
+_STDDEV_FLOOR_FACTOR = 0.05
 
 
 @dataclass
 class InfectionReport:
-    """Report of detected infection"""
+    """Report of detected infection. All logic and display use max_deviation (σ)."""
     agent_id: str
-    severity: float  # 0-10 scale
+    max_deviation: float
     anomalies: List[AnomalyType]
-    deviations: dict  # Metric -> deviation score
-    
+    deviations: Dict[str, float]
+
     def __str__(self):
-        anomaly_str = ", ".join([a.value for a in self.anomalies])
-        return f"InfectionReport[{self.agent_id}]: severity={self.severity:.1f}, anomalies=[{anomaly_str}]"
+        anomaly_str = ", ".join(a.value for a in self.anomalies)
+        return (f"InfectionReport[{self.agent_id}]: max_dev={self.max_deviation:.2f}σ, "
+                f"anomalies=[{anomaly_str}]")
+
+
+def _safe_deviation(value: float, mean: float, stddev: float) -> Optional[float]:
+    """Compute deviation with stddev floor.  Returns None if metric is meaningless."""
+    effective_stddev = max(stddev, abs(mean) * _STDDEV_FLOOR_FACTOR)
+    if effective_stddev <= 0:
+        return None
+    return abs(value - mean) / effective_stddev
 
 
 class Sentinel:
-    """Detects abnormal agent behavior"""
-    
+    """Detects abnormal agent behavior via statistical deviations."""
+
     def __init__(self, threshold_stddev: float = 2.5):
         self.threshold = threshold_stddev
-    
+
     def detect_infection(self, recent_vitals: List, baseline) -> Optional[InfectionReport]:
-        """
-        Detect if agent is infected by comparing recent behavior to baseline.
-        This is where deviation is calculated (recent vs baseline; baseline
-        is derived from older metric data, e.g. in InfluxDB).
-
-        Args:
-            recent_vitals: Recent telemetry data (e.g. from store.get_recent_agent_vitals)
-            baseline: BaselineProfile for this agent (e.g. from store.get_baseline_profile)
-
-        Returns:
-            InfectionReport if infection detected (with severity 0-10), None otherwise.
-        """
         if not recent_vitals or not baseline:
             return None
-        
-        # Get most recent vitals (last 3-5 executions)
+
         sample_size = min(5, len(recent_vitals))
-        recent_sample = recent_vitals[-sample_size:]
-        
-        # Calculate average of recent behavior
-        avg_latency = sum(v.latency_ms for v in recent_sample) / len(recent_sample)
-        avg_tokens = sum(v.token_count for v in recent_sample) / len(recent_sample)
-        avg_tools = sum(v.tool_calls for v in recent_sample) / len(recent_sample)
-        
-        # Calculate deviations (in standard deviations)
-        deviations = {}
-        anomalies = []
-        
-        # Latency deviation
-        if baseline.latency_stddev > 0:
-            latency_dev = abs(avg_latency - baseline.latency_mean) / baseline.latency_stddev
-            deviations['latency'] = latency_dev
-            if latency_dev > self.threshold:
-                anomalies.append(AnomalyType.LATENCY_SPIKE)
-        
-        # Token deviation
-        if baseline.tokens_stddev > 0:
-            tokens_dev = abs(avg_tokens - baseline.tokens_mean) / baseline.tokens_stddev
-            deviations['tokens'] = tokens_dev
-            if tokens_dev > self.threshold:
-                anomalies.append(AnomalyType.TOKEN_SPIKE)
-        
-        # Tool calls deviation
-        if baseline.tools_stddev > 0:
-            tools_dev = abs(avg_tools - baseline.tools_mean) / baseline.tools_stddev
-            deviations['tools'] = tools_dev
-            if tools_dev > self.threshold:
-                anomalies.append(AnomalyType.TOOL_EXPLOSION)
-        
-        # Check retry rate
-        retry_rate = sum(1 for v in recent_sample if v.retries > 0) / len(recent_sample)
-        if retry_rate > 0.3:  # More than 30% retries
-            anomalies.append(AnomalyType.HIGH_RETRY_RATE)
-            # Scale so severity can reach 10 (retry_rate 1.0 -> 10)
-            deviations['retry_rate'] = retry_rate * 10.0
-        
-        # If any anomalies detected, create infection report
+        recent = recent_vitals[-sample_size:]
+        n = len(recent)
+
+        avg_latency = sum(v.latency_ms for v in recent) / n
+        avg_tokens = sum(v.token_count for v in recent) / n
+        avg_tools = sum(v.tool_calls for v in recent) / n
+        avg_input = sum(getattr(v, "input_tokens", 0) for v in recent) / n
+        avg_output = sum(getattr(v, "output_tokens", 0) for v in recent) / n
+        avg_cost = sum(getattr(v, "cost", 0.0) for v in recent) / n
+        retry_rate = sum(1 for v in recent if v.retries > 0) / n
+        error_rate = sum(1 for v in recent if getattr(v, "error_type", "")) / n
+
+        deviations: Dict[str, float] = {}
+        anomalies: List[AnomalyType] = []
+
+        checks = [
+            ("latency", avg_latency, baseline.latency_mean, baseline.latency_stddev, AnomalyType.LATENCY_SPIKE),
+            ("tokens", avg_tokens, baseline.tokens_mean, baseline.tokens_stddev, AnomalyType.TOKEN_SPIKE),
+            ("tools", avg_tools, baseline.tools_mean, baseline.tools_stddev, AnomalyType.TOOL_EXPLOSION),
+            ("input_tokens", avg_input,
+             getattr(baseline, "input_tokens_mean", 0), getattr(baseline, "input_tokens_stddev", 0),
+             AnomalyType.INPUT_TOKEN_SPIKE),
+            ("output_tokens", avg_output,
+             getattr(baseline, "output_tokens_mean", 0), getattr(baseline, "output_tokens_stddev", 0),
+             AnomalyType.OUTPUT_TOKEN_SPIKE),
+            ("cost", avg_cost,
+             getattr(baseline, "cost_mean", 0), getattr(baseline, "cost_stddev", 0),
+             AnomalyType.COST_SPIKE),
+            ("retry_rate", retry_rate,
+             getattr(baseline, "retry_rate_mean", 0), getattr(baseline, "retry_rate_stddev", 0),
+             AnomalyType.HIGH_RETRY_RATE),
+            ("error_rate", error_rate,
+             getattr(baseline, "error_rate_mean", 0), getattr(baseline, "error_rate_stddev", 0),
+             AnomalyType.ERROR_RATE_SPIKE),
+        ]
+
+        for name, value, mean, stddev, anomaly_type in checks:
+            dev = _safe_deviation(value, mean, stddev)
+            if dev is not None:
+                deviations[name] = dev
+                if dev > self.threshold:
+                    anomalies.append(anomaly_type)
+
+        # Prompt hash change detection
+        baseline_hash = getattr(baseline, "prompt_hash", "")
+        if baseline_hash:
+            changed_count = sum(
+                1 for v in recent
+                if getattr(v, "prompt_hash", "") and getattr(v, "prompt_hash", "") != baseline_hash
+            )
+            if changed_count >= n // 2 + 1:
+                anomalies.append(AnomalyType.PROMPT_CHANGE)
+                deviations["prompt_change"] = 10.0
+
         if anomalies:
-            # Severity 0-10: compress high deviations so we get spread (5-10), not always 10
             max_dev = max(deviations.values())
-            severity = min(10.0, round(2.0 + max_dev * 0.45, 1))  # e.g. dev 6->4.7, 12->7.4, 18->10
-            
             return InfectionReport(
                 agent_id=baseline.agent_id,
-                severity=severity,
+                max_deviation=max_dev,
                 anomalies=anomalies,
-                deviations=deviations
+                deviations=deviations,
             )
-        
+
         return None
-    
+
     def get_anomaly_description(self, anomaly: AnomalyType, baseline, recent_avg: float) -> str:
-        """Get human-readable description of anomaly"""
-        if anomaly == AnomalyType.TOKEN_SPIKE:
-            return f"tokens: {recent_avg:.0f} vs baseline {baseline.tokens_mean:.0f}"
-        elif anomaly == AnomalyType.LATENCY_SPIKE:
-            return f"latency: {recent_avg:.0f}ms vs baseline {baseline.latency_mean:.0f}ms"
-        elif anomaly == AnomalyType.TOOL_EXPLOSION:
-            return f"tool calls: {recent_avg:.1f} vs baseline {baseline.tools_mean:.1f}"
-        elif anomaly == AnomalyType.HIGH_RETRY_RATE:
-            return f"retry rate: {recent_avg:.1%}"
-        return str(anomaly)
+        descriptions = {
+            AnomalyType.TOKEN_SPIKE: f"tokens: {recent_avg:.0f} vs baseline {baseline.tokens_mean:.0f}",
+            AnomalyType.LATENCY_SPIKE: f"latency: {recent_avg:.0f}ms vs baseline {baseline.latency_mean:.0f}ms",
+            AnomalyType.TOOL_EXPLOSION: f"tool calls: {recent_avg:.1f} vs baseline {baseline.tools_mean:.1f}",
+            AnomalyType.HIGH_RETRY_RATE: f"retry rate: {recent_avg:.1%}",
+            AnomalyType.INPUT_TOKEN_SPIKE: f"input tokens: {recent_avg:.0f} vs baseline {getattr(baseline, 'input_tokens_mean', 0):.0f}",
+            AnomalyType.OUTPUT_TOKEN_SPIKE: f"output tokens: {recent_avg:.0f} vs baseline {getattr(baseline, 'output_tokens_mean', 0):.0f}",
+            AnomalyType.COST_SPIKE: f"cost: ${recent_avg:.4f} vs baseline ${getattr(baseline, 'cost_mean', 0):.4f}",
+            AnomalyType.PROMPT_CHANGE: "system prompt hash changed",
+            AnomalyType.ERROR_RATE_SPIKE: f"error rate: {recent_avg:.1%}",
+        }
+        return descriptions.get(anomaly, str(anomaly))
