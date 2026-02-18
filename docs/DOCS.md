@@ -2,6 +2,8 @@
 
 This document is the **single reference** for the AI Agent Immune System: architecture, deployment, server API, healing and deviation, internal design (HLD/LLD), and operations. Keep this doc as the source of truth; update it when anything changes.
 
+> **Viewing diagrams:** This doc uses [Mermaid](https://mermaid.js.org/) diagrams. They render natively on **GitHub**. In **VS Code / Cursor**, install the [Markdown Preview Mermaid Support](https://marketplace.visualstudio.com/items?itemName=bierner.markdown-mermaid) extension (`bierner.markdown-mermaid`), then preview with `Cmd+Shift+V`.
+
 ---
 
 ## 1. Executive Summary
@@ -23,44 +25,37 @@ This document is the **single reference** for the AI Agent Immune System: archit
 
 ### 2.1 Topology overview
 
-```
-┌─────────────────────────────────────────────────────────────────────────────────────────┐
-│  CLIENT SIDE (Customer environment)                                                       │
-│                                                                                          │
-│  ┌──────────────────────────────────────────────────────────────────────────────────┐   │
-│  │ AI Agents                                                                         │   │
-│  │ • Run tasks, emit vitals (latency, tokens, tool_calls, retries, success)          │   │
-│  └──────────────────────────────────────────────────────────────────────────────────┘   │
-│                                          │                                               │
-│                                          ▼                                               │
-│  ┌──────────────────────────────────────────────────────────────────────────────────┐   │
-│  │ AI Agent Immune System (same process or same host/cluster)                         │   │
-│  │ • TelemetryCollector • BaselineLearner • Sentinel • Diagnostician • Healer        │   │
-│  │ • QuarantineController • ImmuneMemory • Orchestrator • Web Dashboard              │   │
-│  │ • Store = ApiStore → calls SERVER REST API only (no direct InfluxDB)               │   │
-│  └──────────────────────────────────────────────────────────────────────────────────┘   │
-│                                          │                                               │
-│                              HTTPS → REST API (all DB operations)                       │
-└─────────────────────────────────────────────────────────────────────────────────────────┘
-                                          │
-                                          ▼
-┌─────────────────────────────────────────────────────────────────────────────────────────┐
-│  SERVER SIDE (Your backend)                                                               │
-│                                                                                          │
-│  ┌──────────────────────────────────────────────────────────────────────────────────┐   │
-│  │ Server App (API layer)                                                             │   │
-│  │ • REST API that mirrors InfluxStore operations                                     │   │
-│  │ • Auth (e.g. API key or OAuth per client/tenant)                                   │   │
-│  │ • Validates and forwards requests to InfluxDB                                     │   │
-│  └──────────────────────────────────────────────────────────────────────────────────┘   │
-│                                          │                                               │
-│                                          ▼                                               │
-│  ┌──────────────────────────────────────────────────────────────────────────────────┐   │
-│  │ InfluxDB                                                                          │   │
-│  │ • agent_vitals, baseline_profile, infection_event, quarantine_event,              │   │
-│  │   approval_event, healing_event, action_log (same schema as InfluxStore)          │   │
-│  └──────────────────────────────────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph client ["CLIENT SIDE (Customer environment)"]
+        Agents["AI Agents<br/>Emit vitals per task"]
+
+        subgraph immune ["Immune System (same process / host)"]
+            Orch[Orchestrator]
+            Tel[Telemetry] --> BL[Baseline]
+            Orch --> Sen[Sentinel]
+            Sen --> Diag[Diagnostician] --> Heal[Healer]
+            Sen --> Q[Quarantine]
+            Heal --> Mem[Memory]
+            Dash[Dashboard]
+        end
+
+        AS[ApiStore]
+    end
+
+    subgraph server ["SERVER SIDE (Your backend)"]
+        API["Server App<br/>REST API · Auth"]
+        DB[("InfluxDB")]
+    end
+
+    Agents --> Tel
+    Dash -->|"Approve / Reject"| Orch
+    AS -->|HTTPS| API
+    API --> DB
+
+    style client fill:#f0f7ff,stroke:#4a86c8,color:#1a1a1a
+    style immune fill:#e8f5e9,stroke:#66bb6a,color:#1a1a1a
+    style server fill:#f3e5f5,stroke:#ab47bc,color:#1a1a1a
 ```
 
 - **Client:** AI agents + full immune system; store is **ApiStore** (HTTP to server only). No InfluxDB client on the client.
@@ -71,7 +66,7 @@ This document is the **single reference** for the AI Agent Immune System: archit
 
 | Component | Responsibility |
 |-----------|-----------------|
-| **AI agents** | Execute tasks; produce vitals (latency, token_count, tool_calls, retries, success). Stable `agent_id` (and optional agent_type, model, mcp_servers). |
+| **AI agents** | Execute tasks; produce vitals (latency_ms, input_tokens, output_tokens, token_count, tool_calls, retries, success, cost, model, error_type, prompt_hash). Stable `agent_id` (and optional agent_type, model, mcp_servers). |
 | **Orchestrator** | Runs agent loops, sentinel loop, baseline learning; coordinates all components; uses **store** for persistence. |
 | **TelemetryCollector** | Records vitals via `store.write_agent_vitals()`; reads recent vitals via `store.get_recent_agent_vitals()`, etc. |
 | **BaselineLearner** | Reads vitals from store; computes per-agent baseline (mean, stddev); writes via `store.write_baseline_profile()`; reads via `store.get_baseline_profile()`. |
@@ -114,6 +109,73 @@ Entry point: `main.py` or `demo.py` with `SERVER_API_BASE_URL` (and optional `SE
 | Dashboard | `immune_system/web_dashboard.py` | Flask REST + UI; approve/reject/heal-now. |
 | Store (direct DB) | `immune_system/influx_store.py` | InfluxStore when using InfluxDB directly. |
 | Store (API) | `immune_system/api_store.py` | ApiStore when using server REST API. |
+| Python SDK | `immune_sdk.py` | Lightweight reporter for external Python agents (wraps HTTP ingest). |
+| Start script | `start.sh` | Sets env vars and launches `main.py`. |
+
+### 2.6 Agent–immune system communication (client-side)
+
+How agents and the immune system communicate. The system supports **two modes simultaneously**: simulated agents running in-process (for demos) and real external agents reporting via HTTP or the Python SDK.
+
+```mermaid
+flowchart TB
+    subgraph ext ["Real AI Agents"]
+        direction LR
+        Py["Python Agent<br/>(immune_sdk)"]
+        Other["Any Language<br/>(HTTP POST)"]
+    end
+
+    subgraph sim ["Simulation"]
+        SimA["Simulated Agents"]
+    end
+
+    Py -->|SDK| Ingest["POST /api/v1/ingest"]
+    Other -->|HTTP JSON| Ingest
+    Ingest --> Tel[TelemetryCollector]
+
+    SimA -->|in-process| Orch[Orchestrator]
+    Orch --> Tel
+    Tel --> DB[(InfluxDB)]
+
+    Orch --> BL[BaselineLearner]
+    Orch --> Sen[Sentinel]
+    Sen --> Diag[Diagnostician]
+    Diag --> Heal[Healer]
+    Dash[Web Dashboard] -->|"Approve / Reject"| Orch
+```
+
+**Mode 1 — Simulated agents (in-process, for demos):**
+- The **orchestrator** owns the asyncio loop and drives both agents and the immune system.
+- Each tick, for each agent: `vitals = await agent.execute()` then `self.telemetry.record(vitals)`.
+- Communication is **synchronous in-process**: orchestrator pulls vitals from agents and pushes them into `TelemetryCollector`, which either keeps them in memory or writes to the store (InfluxDB or server API).
+- The immune system never calls into the agent except for healing (e.g. `agent.state.reset_memory()`). Agents do not call the immune system; the orchestrator is the only bridge.
+
+**Mode 2 — Real external agents (HTTP ingest + Python SDK):**
+
+Real agents report vitals via the implemented HTTP ingest endpoint or the Python SDK. Both paths write into the same `TelemetryCollector` and flow through the same baseline/detection/healing pipeline.
+
+- **HTTP API (`POST /api/v1/ingest`):** Any agent in any language POSTs a JSON payload with vitals fields (`agent_id`, `input_tokens`, `output_tokens`, `latency_ms`, `tool_calls`, `cost`, `model`, `error_type`, `prompt_hash`, etc.). Unknown agents are auto-registered. Endpoint is on the dashboard Flask server (port 8090).
+- **Python SDK (`immune_sdk.py`):** Python agents import `ImmuneReporter` and call `reporter.report(...)` after each LLM call. The SDK wraps `POST /api/v1/ingest` and handles auto-registration.
+- **Agent registration (`POST /api/v1/agents/register`):** Optional explicit registration with `agent_id`, `agent_type`, and `model`. The ingest endpoint auto-registers on first vitals report if the agent is unknown.
+
+**Vitals fields (production):**
+
+| Field | Source | Description |
+|-------|--------|-------------|
+| `input_tokens` | LLM response `usage.prompt_tokens` | Prompt / input tokens |
+| `output_tokens` | LLM response `usage.completion_tokens` | Completion / output tokens |
+| `token_count` | `input_tokens + output_tokens` | Total tokens (backward compat) |
+| `latency_ms` | Wall-clock measurement | End-to-end agent turn latency |
+| `tool_calls` | Agent framework | Number of tool/function calls |
+| `retries` | Agent retry logic | Number of retry attempts |
+| `cost` | Calculated from tokens × model price | Estimated cost in USD |
+| `model` | Agent config | LLM model used (e.g. `gpt-4o`) |
+| `error_type` | Agent error handling | Error category (`rate_limit`, `timeout`, `content_filter`, or empty) |
+| `prompt_hash` | Hash of system prompt | Detects prompt drift / injection |
+| `success` | Agent outcome | Whether the task completed |
+
+**Other integration patterns (not yet implemented):**
+- **Pull by immune system:** Immune system reads vitals from a **shared store** (e.g. InfluxDB or server API) that agents write to independently.
+- **OTEL / tracing:** Agents emit OTEL metrics/spans; the immune system reads from the same backend the collector writes to.
 
 ---
 
@@ -124,55 +186,33 @@ The system is an async control plane: persistence can be **InfluxDB-backed** (ru
 ### 3.1 HLD (High-Level Design)
 
 ```mermaid
-flowchart LR
-    A[Agent Runtime\n10-15 simulated agents] --> B[Immune System Orchestrator\nAsync control plane]
-    B --> C[Web Dashboard\nFlask + REST + UI]
-    B --> D[(InfluxDB\nsource of truth for run data)]
-    B --> E[OTel SDK Metrics]
-    E --> F[OTel Collector\nOTLP receiver]
-
-    subgraph BI[Orchestrator Internal Components]
-      T[TelemetryCollector]
-      BL[BaselineLearner]
-      S[Sentinel]
-      DG[Diagnostician]
-      H[Healer]
-      IM[ImmuneMemory]
-      Q[QuarantineController]
-      CH[ChaosInjector]
-    end
-
-    B --> BI
-    C -->|Approve/Reject/Heal-now| B
+flowchart TB
+    A["Agent Sources"] --> B[Orchestrator]
+    B --> C[Web Dashboard]
+    C -->|"Approve / Reject"| B
+    B --> D[("InfluxDB")]
+    B --> E[OTel SDK] --> F[OTel Collector]
+    B --> G["Telemetry · Baseline · Sentinel<br/>Diagnostician · Healer<br/>Memory · QuarantineCtrl"]
 ```
 
 ### 3.2 LLD (Low-Level Design)
 
 ```mermaid
 flowchart TD
-    M[main.py / demo.py] --> O[ImmuneSystemOrchestrator]
+    M["main.py / demo.py"] --> O[Orchestrator]
     M --> W[WebDashboard]
-    W -->|set_loop| O
+    W -->|"REST + set_loop"| O
 
-    O --> T[TelemetryCollector]
+    O --> TC[TelemetryCollector]
     O --> BL[BaselineLearner]
     O --> S[Sentinel]
     O --> D[Diagnostician]
     O --> H[Healer]
     O --> IM[ImmuneMemory]
-    O --> Q[QuarantineController]
+    O --> Q[QuarantineCtrl]
     O --> CH[ChaosInjector]
-    O --> IS[InfluxStore]
 
-    T -->|record/get_recent/get_latest|getIS[(Influx measurements)]
-    BL -->|save/get baseline|getIS
-    IM -->|failed actions/pattern queries|getIS
-    O -->|approval/reject state|getIS
-    O -->|action log|getIS
-
-    W -->|/api/agents /stats /pending /rejected /healings| O
-    W -->|POST approve/reject/heal-now| O
-    O -->|run_coroutine_threadsafe| O
+    TC & BL & IM & O --> IS[("Store<br/>(InfluxStore / ApiStore)")]
 ```
 
 *Note: Store may be InfluxStore or ApiStore; when ApiStore, all DB operations go via HTTP to the server.*
@@ -181,50 +221,58 @@ flowchart TD
 
 ```mermaid
 sequenceDiagram
-    participant Agent as Agent.execute()
-    participant Orch as Orchestrator
-    participant Tel as TelemetryCollector
-    participant Inf as InfluxDB
-    participant Sen as Sentinel
-    participant UI as Dashboard/UI
-    participant Heal as Healer
+    participant A as Agent
+    participant O as Orchestrator
+    participant T as Telemetry
+    participant S as Store
+    participant D as Sentinel
+    participant U as Dashboard
+    participant H as Healer
 
-    loop Every 1s per agent
-        Agent->>Orch: vitals dict
-        Orch->>Tel: record(vitals)
-        Tel->>Inf: write agent_vitals (run_id scoped)
-        Orch->>Tel: get_count/get_all
-        Orch->>Orch: baseline readiness check
-        Orch->>Inf: write/read baseline_profile
+    rect rgb(230, 245, 255)
+    note over A, H: AGENT LOOP (1s per agent)
+    A->>O: vitals
+    O->>T: record(vitals)
+    T->>S: write vitals
+    O->>T: get_count
+    O->>S: write/read baseline
     end
 
-    loop Every 1s sentinel
-        Orch->>Tel: get_recent(agent, 10s)
-        Tel->>Inf: query recent vitals
-        Orch->>Sen: detect_infection(recent, baseline)
+    rect rgb(255, 243, 224)
+    note over A, H: SENTINEL LOOP (1s)
+    O->>T: get_recent(10s)
+    T->>S: query vitals
+    O->>D: detect_infection()
 
-        alt agent.infected or anomaly detected
-            Orch->>Inf: write infection/quarantine events
-            alt severity >= threshold
-                Orch->>Inf: write approval_event=pending
-                UI->>Orch: approve/reject
-                alt approved
-                    Orch->>Heal: heal_agent(trigger=after_approval)
-                else rejected
-                    Orch->>Inf: write approval_event=rejected
-                end
-            else mild
-                Orch->>Heal: heal_agent(trigger=auto)
+    alt infection detected
+        O->>S: write infection + quarantine
+
+        alt severe (≥ threshold)
+            O->>S: approval = pending
+            U->>O: approve / reject
+            alt approved
+                O->>H: heal_agent()
+                H->>S: write healing event
+                H-->>O: result
+                O->>S: release quarantine
+            else rejected
+                O->>S: approval = rejected
             end
-        end
 
-        Heal->>Inf: write healing_event + action_log
-        Heal->>Orch: success/fail
-        Orch->>Inf: quarantine release event
+        else mild (auto-heal)
+            O->>H: heal_agent()
+            H->>S: write healing event
+            H-->>O: result
+            O->>S: release quarantine
+        end
+    end
     end
 
-    UI->>Orch: GET stats/agents/pending/rejected/healings
-    Orch->>Inf: query run-scoped state
+    rect rgb(232, 245, 233)
+    note over A, H: DASHBOARD READS
+    U->>O: GET stats / agents / pending
+    O->>S: query state
+    end
 ```
 
 ### 3.4 Component mapping (file-level)
@@ -244,6 +292,8 @@ sequenceDiagram
 - `immune_system/api_store.py` — Server API–backed store (used when `SERVER_API_BASE_URL` is set). See §6 for API contract.
 - `immune_system/logging_config.py` — Logging setup (JSON or colored console).
 - `immune_system/quarantine.py`, `immune_system/chaos.py` — Quarantine controller and chaos injector.
+- `immune_sdk.py` — Lightweight Python SDK for external agents (wraps `POST /api/v1/ingest`).
+- `start.sh` — Convenience script that sets env vars and launches `main.py`.
 - `observability/docker-compose.yml` — Local InfluxDB and OTel Collector stack.
 - `observability/otel-collector-config.yaml` — OTLP receiver + debug exporter pipeline.
 
@@ -256,7 +306,8 @@ sequenceDiagram
 **Only in:** `immune_system/detection.py` → **`Sentinel.detect_infection(recent_vitals, baseline)`**
 
 - **Inputs:** `recent_vitals` (e.g. last 10s from store/InfluxDB), `baseline` (mean/stddev per metric from store/InfluxDB). Baseline is learned from **older metric data** in InfluxDB.
-- **Logic:** Averages of recent latency, tokens, tools; per-metric deviation = |avg − baseline_mean| / baseline_stddev; anomaly if deviation > `threshold_stddev` (default 2.5); severity = min(10, 2 + max_dev * 0.45).
+- **Logic:** Averages of recent latency, tokens (total, input, output), cost, tools; per-metric deviation = |avg − baseline_mean| / baseline_stddev; anomaly if deviation > `threshold_stddev` (default 2.5); severity = min(10, 2 + max_dev * 0.45). Also checks: retry rate > 30%, error rate > 30%, and prompt hash changes vs baseline.
+- **Anomaly types:** `token_spike`, `latency_spike`, `tool_explosion`, `high_retry_rate`, `input_token_spike`, `output_token_spike`, `cost_spike`, `prompt_change`, `error_rate_spike`.
 - **Output:** `InfectionReport` (severity 0–10, anomalies, deviations).
 
 Orchestrator gets recent vitals and baseline from the store (InfluxDB or API), calls `sentinel.detect_infection(recent, baseline)` → deviation and severity are computed there.
@@ -275,6 +326,7 @@ Orchestrator gets recent vitals and baseline from the store (InfluxDB or API), c
 - **reset_memory** → `agent.state.reset_memory()`  
 - **rollback_prompt** → `agent.state.rollback_prompt()`  
 - **reduce_autonomy** → `agent.state.reduce_autonomy()`  
+- **revoke_tools** → `agent.state.revoke_tools()` (disables tool access; used for prompt injection and infinite loop)  
 - **clone_agent** → platform-specific.  
 Status: `HEALTHY`, `INFECTED`, `QUARANTINED`; after successful healing, release from quarantine.
 
@@ -307,7 +359,7 @@ Run context via header `X-Run-Id` or query `run_id`. Server maps each endpoint t
 
 | Method | Path | Request | Response |
 |--------|------|---------|----------|
-| POST | `/api/v1/vitals` | JSON: agent_id, agent_type?, latency_ms, token_count, tool_calls, retries, success, timestamp? | 204 |
+| POST | `/api/v1/vitals` | JSON: agent_id, agent_type?, latency_ms, token_count, input_tokens?, output_tokens?, tool_calls, retries, success, cost?, model?, error_type?, prompt_hash?, timestamp? | 204 |
 | GET | `/api/v1/vitals/recent` | Query: agent_id, window_seconds | 200 JSON array |
 | GET | `/api/v1/vitals/all` | Query: agent_id | 200 JSON array |
 | GET | `/api/v1/vitals/latest` | Query: agent_id | 200 object or 404 |
@@ -318,7 +370,7 @@ Run context via header `X-Run-Id` or query `run_id`. Server maps each endpoint t
 
 | Method | Path | Request | Response |
 |--------|------|---------|----------|
-| POST | `/api/v1/baselines` | JSON: baseline profile (agent_id, latency_mean, latency_stddev, ...) | 204 |
+| POST | `/api/v1/baselines` | JSON: baseline profile (agent_id, latency_mean/stddev/p95, tokens_mean/stddev/p95, tools_mean/stddev/p95, input_tokens_*, output_tokens_*, cost_*, prompt_hash, sample_size) | 204 |
 | GET | `/api/v1/baselines/{agent_id}` | - | 200 or 404 |
 | GET | `/api/v1/baselines/count` | - | 200 `{ "count": number }` |
 
@@ -386,23 +438,19 @@ When the immune system runs as **separate services** (not on the client):
 - **Immune system:** Deployed as pods/services: Telemetry Ingestion, Baseline Service, Sentinel (detection), Quarantine+Approval, Healer, Dashboard API. Each can scale independently.
 - **Backend:** Central DB (e.g. PostgreSQL or InfluxDB) for baselines, quarantine state, approvals, immune memory, action log. OTEL backend (e.g. Prometheus, Tempo, vendor) for metrics/traces.
 
-```
-                    Ingress (TLS, auth)
-                          │
-         ┌────────────────┼────────────────┐
-         ▼                ▼                ▼
-   Dashboard         API Gateway      Webhooks
-         │                │                │
-         └────────────────┼────────────────┘
-                          ▼
-   ┌─────────────────────────────────────────────────────────────┐
-   │ Immune System Services (Pods)                                │
-   │ Telemetry Ingestion │ Baseline │ Sentinel │ Quarantine+Approval │ Healer │
-   └─────────────────────────────────────────────────────────────┘
-                          │
-         ┌────────────────┼────────────────┐
-         ▼                ▼                ▼
-   PostgreSQL         Redis (opt.)    OTEL Backend
+```mermaid
+flowchart TB
+    Ingress["Ingress (TLS, auth)"]
+    Ingress --> Dashboard & Gateway[API Gateway] & Webhooks
+
+    subgraph services ["Immune System Services (Pods)"]
+        direction LR
+        TI[Telemetry] ~~~ BL[Baseline] ~~~ Sen[Sentinel]
+        QA[Quarantine] ~~~ Heal[Healer]
+    end
+
+    Dashboard & Gateway & Webhooks --> services
+    services --> PG[(PostgreSQL)] & Redis["Redis"] & OTEL[OTEL Backend]
 ```
 
 Same logical components (telemetry, baseline, sentinel, healer, approval); data path is OTEL → ingestion → store, and detection/healing run in your cluster instead of on the client. For the **recommended** client-deployed model, all of that runs on the client and persistence goes through the server API + InfluxDB (§2).
@@ -429,7 +477,7 @@ Same logical components (telemetry, baseline, sentinel, healer, approval); data 
 ### 12.1 Runtime notes
 
 - Tick interval: 1 second (agent loop and sentinel loop).
-- Baseline warmup: ~15 samples per agent.
+- Baseline warmup: ~20 samples per agent (configurable via `BaselineLearner.min_samples`).
 - Severe infections require explicit approval.
 - Rejected healings remain quarantined until user clicks Heal now.
 - Run isolation: all Influx reads/writes are filtered by `run_id` to avoid historical contamination (or `X-Run-Id` when using server API).
@@ -618,11 +666,11 @@ When system behavior looks wrong, run this checklist in order:
 
 3. **API sanity**
    - `/api/status` -> `running=true`
-   - `/api/agents` returns 10 agents
+   - `/api/agents` returns 10–15 agents (10 for `demo.py`, 15 for `main.py`)
    - `/api/stats` has nonzero `total_executions`
 
 4. **Baseline progression**
-   - Around ~15 samples/agent, `has_baseline` should become true in `/api/agents`.
+   - Around ~20 samples/agent, `has_baseline` should become true in `/api/agents`.
 
 5. **Approval flow**
    - Check `/api/pending-approvals` for severe cases.

@@ -66,18 +66,27 @@ class InfluxStore:
     # -------- Telemetry --------
 
     def write_agent_vitals(self, vitals: Dict[str, Any]):
+        input_tokens = float(vitals.get("input_tokens", 0))
+        output_tokens = float(vitals.get("output_tokens", 0))
+        token_count = float(vitals.get("token_count", 0)) or (input_tokens + output_tokens)
         self._write(
             measurement="agent_vitals",
             tags={
                 "agent_id": vitals["agent_id"],
                 "agent_type": vitals.get("agent_type", "unknown"),
+                "model": vitals.get("model", ""),
             },
             fields={
                 "latency_ms": float(vitals["latency_ms"]),
-                "token_count": float(vitals["token_count"]),
+                "token_count": token_count,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "cost": float(vitals.get("cost", 0.0)),
                 "tool_calls": float(vitals["tool_calls"]),
                 "retries": float(vitals["retries"]),
                 "success": int(bool(vitals["success"])),
+                "error_type": vitals.get("error_type", ""),
+                "prompt_hash": vitals.get("prompt_hash", ""),
             },
             timestamp=vitals.get("timestamp", time.time()),
         )
@@ -105,9 +114,15 @@ from(bucket: "{self.bucket}")
                         "agent_type": values.get("agent_type", "unknown"),
                         "latency_ms": int(values.get("latency_ms", 0) or 0),
                         "token_count": int(values.get("token_count", 0) or 0),
+                        "input_tokens": int(values.get("input_tokens", 0) or 0),
+                        "output_tokens": int(values.get("output_tokens", 0) or 0),
+                        "cost": float(values.get("cost", 0.0) or 0.0),
                         "tool_calls": int(values.get("tool_calls", 0) or 0),
                         "retries": int(values.get("retries", 0) or 0),
                         "success": bool(int(values.get("success", 0) or 0)),
+                        "model": values.get("model", ""),
+                        "error_type": str(values.get("error_type", "") or ""),
+                        "prompt_hash": str(values.get("prompt_hash", "") or ""),
                     }
                 )
         return rows
@@ -153,21 +168,32 @@ from(bucket: "{self.bucket}")
     # -------- Baselines --------
 
     def write_baseline_profile(self, profile: Dict[str, Any]):
+        fields = {
+            # Keep numeric schema stable in InfluxDB (always float for metric stats).
+            "latency_mean": float(profile["latency_mean"]),
+            "latency_stddev": float(profile["latency_stddev"]),
+            "latency_p95": float(profile["latency_p95"]),
+            "tokens_mean": float(profile["tokens_mean"]),
+            "tokens_stddev": float(profile["tokens_stddev"]),
+            "tokens_p95": float(profile["tokens_p95"]),
+            "tools_mean": float(profile["tools_mean"]),
+            "tools_stddev": float(profile["tools_stddev"]),
+            "tools_p95": float(profile["tools_p95"]),
+            "sample_size": int(profile["sample_size"]),
+            "input_tokens_mean": float(profile.get("input_tokens_mean", 0.0)),
+            "input_tokens_stddev": float(profile.get("input_tokens_stddev", 0.0)),
+            "input_tokens_p95": float(profile.get("input_tokens_p95", 0.0)),
+            "output_tokens_mean": float(profile.get("output_tokens_mean", 0.0)),
+            "output_tokens_stddev": float(profile.get("output_tokens_stddev", 0.0)),
+            "output_tokens_p95": float(profile.get("output_tokens_p95", 0.0)),
+            "cost_mean": float(profile.get("cost_mean", 0.0)),
+            "cost_stddev": float(profile.get("cost_stddev", 0.0)),
+            "cost_p95": float(profile.get("cost_p95", 0.0)),
+        }
         self._write(
             measurement="baseline_profile",
             tags={"agent_id": profile["agent_id"]},
-            fields={
-                "latency_mean": profile["latency_mean"],
-                "latency_stddev": profile["latency_stddev"],
-                "latency_p95": profile["latency_p95"],
-                "tokens_mean": profile["tokens_mean"],
-                "tokens_stddev": profile["tokens_stddev"],
-                "tokens_p95": profile["tokens_p95"],
-                "tools_mean": profile["tools_mean"],
-                "tools_stddev": profile["tools_stddev"],
-                "tools_p95": profile["tools_p95"],
-                "sample_size": int(profile["sample_size"]),
-            },
+            fields=fields,
             timestamp=time.time(),
         )
 
@@ -195,6 +221,15 @@ from(bucket: "{self.bucket}")
                     "tools_mean": float(values.get("tools_mean", 0.0) or 0.0),
                     "tools_stddev": float(values.get("tools_stddev", 0.0) or 0.0),
                     "tools_p95": float(values.get("tools_p95", 0.0) or 0.0),
+                    "input_tokens_mean": float(values.get("input_tokens_mean", 0.0) or 0.0),
+                    "input_tokens_stddev": float(values.get("input_tokens_stddev", 0.0) or 0.0),
+                    "input_tokens_p95": float(values.get("input_tokens_p95", 0.0) or 0.0),
+                    "output_tokens_mean": float(values.get("output_tokens_mean", 0.0) or 0.0),
+                    "output_tokens_stddev": float(values.get("output_tokens_stddev", 0.0) or 0.0),
+                    "output_tokens_p95": float(values.get("output_tokens_p95", 0.0) or 0.0),
+                    "cost_mean": float(values.get("cost_mean", 0.0) or 0.0),
+                    "cost_stddev": float(values.get("cost_stddev", 0.0) or 0.0),
+                    "cost_p95": float(values.get("cost_p95", 0.0) or 0.0),
                     "sample_size": int(values.get("sample_size", 0) or 0),
                 }
         return None

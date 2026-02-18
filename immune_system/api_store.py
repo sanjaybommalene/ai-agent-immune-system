@@ -66,14 +66,23 @@ class ApiStore:
     # -------- Telemetry --------
 
     def write_agent_vitals(self, vitals: Dict[str, Any]) -> None:
+        input_tokens = vitals.get("input_tokens", 0)
+        output_tokens = vitals.get("output_tokens", 0)
+        token_count = vitals.get("token_count", 0) or (input_tokens + output_tokens)
         payload = {
             "agent_id": vitals["agent_id"],
             "agent_type": vitals.get("agent_type", "unknown"),
             "latency_ms": vitals["latency_ms"],
-            "token_count": vitals["token_count"],
+            "token_count": token_count,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cost": vitals.get("cost", 0.0),
             "tool_calls": vitals["tool_calls"],
             "retries": vitals["retries"],
             "success": vitals["success"],
+            "model": vitals.get("model", ""),
+            "error_type": vitals.get("error_type", ""),
+            "prompt_hash": vitals.get("prompt_hash", ""),
         }
         if "timestamp" in vitals:
             payload["timestamp"] = vitals["timestamp"]

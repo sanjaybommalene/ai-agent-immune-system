@@ -12,36 +12,43 @@ class HealingAction(Enum):
     RESET_MEMORY = "reset_memory"
     ROLLBACK_PROMPT = "rollback_prompt"
     REDUCE_AUTONOMY = "reduce_autonomy"
+    REVOKE_TOOLS = "revoke_tools"
     CLONE_AGENT = "clone_agent"
 
 
-# HEALING POLICY REGISTRY - Maps diagnosis to ordered healing ladder
 HEALING_POLICIES = {
     DiagnosisType.PROMPT_DRIFT: [
         HealingAction.RESET_MEMORY,
         HealingAction.ROLLBACK_PROMPT,
         HealingAction.REDUCE_AUTONOMY,
-        HealingAction.CLONE_AGENT
+        HealingAction.CLONE_AGENT,
+    ],
+    DiagnosisType.PROMPT_INJECTION: [
+        HealingAction.REVOKE_TOOLS,
+        HealingAction.RESET_MEMORY,
+        HealingAction.ROLLBACK_PROMPT,
+        HealingAction.CLONE_AGENT,
     ],
     DiagnosisType.INFINITE_LOOP: [
+        HealingAction.REVOKE_TOOLS,
         HealingAction.REDUCE_AUTONOMY,
         HealingAction.RESET_MEMORY,
-        HealingAction.CLONE_AGENT
+        HealingAction.CLONE_AGENT,
     ],
     DiagnosisType.TOOL_INSTABILITY: [
         HealingAction.REDUCE_AUTONOMY,
         HealingAction.ROLLBACK_PROMPT,
-        HealingAction.CLONE_AGENT
+        HealingAction.CLONE_AGENT,
     ],
     DiagnosisType.MEMORY_CORRUPTION: [
         HealingAction.RESET_MEMORY,
-        HealingAction.CLONE_AGENT
+        HealingAction.CLONE_AGENT,
     ],
     DiagnosisType.UNKNOWN: [
         HealingAction.RESET_MEMORY,
         HealingAction.REDUCE_AUTONOMY,
-        HealingAction.CLONE_AGENT
-    ]
+        HealingAction.CLONE_AGENT,
+    ],
 }
 
 
@@ -113,6 +120,10 @@ class Healer:
             elif action == HealingAction.REDUCE_AUTONOMY:
                 agent.state.reduce_autonomy()
                 message = f"Autonomy reduced (temp={agent.state.temperature:.2f}, max_tools={agent.state.max_tools})"
+            
+            elif action == HealingAction.REVOKE_TOOLS:
+                agent.state.revoke_tools()
+                message = "Tool access revoked"
             
             elif action == HealingAction.CLONE_AGENT:
                 # In real system, would create new agent instance

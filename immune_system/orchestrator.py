@@ -109,7 +109,7 @@ class ImmuneSystemOrchestrator:
         }
 
     def _infection_from_payload(self, agent_id: str, payload: Dict[str, Any], fallback: Optional[Dict[str, Any]] = None) -> InfectionReport:
-        from detection import AnomalyType
+        from .detection import AnomalyType
 
         base = payload or {}
         if not base and fallback:

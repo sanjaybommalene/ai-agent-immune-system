@@ -34,6 +34,8 @@ class WebDashboard:
         self.app.route('/api/rejected-approvals')(self.get_rejected_approvals)
         self.app.route('/api/heal-explicitly', methods=['POST'])(self.post_heal_explicitly)
         self.app.route('/api/heal-all-rejected', methods=['POST'])(self.post_heal_all_rejected)
+        self.app.route('/api/v1/ingest', methods=['POST'])(self.post_ingest)
+        self.app.route('/api/v1/agents/register', methods=['POST'])(self.post_register_agent)
 
     def set_loop(self, loop: asyncio.AbstractEventLoop):
         """Set the asyncio event loop so approve-healing can schedule heal from Flask thread."""
@@ -76,7 +78,12 @@ class WebDashboard:
                 'latest_metrics': {
                     'latency': latest.latency_ms if latest else 0,
                     'tokens': latest.token_count if latest else 0,
-                    'tools': latest.tool_calls if latest else 0
+                    'input_tokens': latest.input_tokens if latest else 0,
+                    'output_tokens': latest.output_tokens if latest else 0,
+                    'cost': latest.cost if latest else 0.0,
+                    'tools': latest.tool_calls if latest else 0,
+                    'model': latest.model if latest else '',
+                    'error_type': latest.error_type if latest else '',
                 } if latest else None
             })
 
@@ -158,6 +165,76 @@ class WebDashboard:
             'approved_count': len(approved_list),
             'rejected_count': 0 if approved else pending_count,
         })
+
+    # ---- External agent integration endpoints ----
+
+    def post_ingest(self):
+        """Ingest vitals from an external (real) AI agent.
+
+        POST JSON body:
+            agent_id (required), agent_type, latency_ms, input_tokens,
+            output_tokens, token_count, tool_calls, retries, success,
+            cost, model, error_type, prompt_hash.
+        """
+        data = request.get_json(silent=True) or {}
+        agent_id = data.get('agent_id')
+        if not agent_id:
+            return jsonify({'ok': False, 'error': 'agent_id is required'}), 400
+
+        # Auto-register unknown agents so external agents don't need a separate call
+        if agent_id not in self.orchestrator.agents:
+            from .agents import BaseAgent
+            agent = BaseAgent(
+                agent_id=agent_id,
+                agent_type=data.get('agent_type', 'external'),
+                model_name=data.get('model', 'unknown'),
+            )
+            self.orchestrator.agents[agent_id] = agent
+
+        input_tokens = int(data.get('input_tokens', 0))
+        output_tokens = int(data.get('output_tokens', 0))
+        token_count = int(data.get('token_count', 0)) or (input_tokens + output_tokens)
+
+        vitals_dict = {
+            'agent_id': agent_id,
+            'agent_type': data.get('agent_type', 'external'),
+            'latency_ms': int(data.get('latency_ms', 0)),
+            'token_count': token_count,
+            'input_tokens': input_tokens,
+            'output_tokens': output_tokens,
+            'cost': float(data.get('cost', 0.0)),
+            'tool_calls': int(data.get('tool_calls', 0)),
+            'retries': int(data.get('retries', 0)),
+            'success': bool(data.get('success', True)),
+            'model': data.get('model', ''),
+            'error_type': data.get('error_type', ''),
+            'prompt_hash': data.get('prompt_hash', ''),
+            'timestamp': data.get('timestamp', time.time()),
+        }
+        self.orchestrator.telemetry.record(vitals_dict)
+        return jsonify({'ok': True})
+
+    def post_register_agent(self):
+        """Register an external agent with the immune system.
+
+        POST JSON body: agent_id (required), agent_type, model.
+        """
+        data = request.get_json(silent=True) or {}
+        agent_id = data.get('agent_id')
+        if not agent_id:
+            return jsonify({'ok': False, 'error': 'agent_id is required'}), 400
+
+        if agent_id in self.orchestrator.agents:
+            return jsonify({'ok': True, 'status': 'already_registered'})
+
+        from .agents import BaseAgent
+        agent = BaseAgent(
+            agent_id=agent_id,
+            agent_type=data.get('agent_type', 'external'),
+            model_name=data.get('model', 'unknown'),
+        )
+        self.orchestrator.agents[agent_id] = agent
+        return jsonify({'ok': True, 'status': 'registered'})
 
     def get_stats(self):
         """Get overall statistics"""
