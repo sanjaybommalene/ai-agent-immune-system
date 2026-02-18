@@ -24,9 +24,9 @@ logger = get_logger("orchestrator")
 # Backend tick interval (seconds) - aligned with UI poll interval in web_dashboard.py
 TICK_INTERVAL_SECONDS = 1.0
 
-# Severe infections (severity >= this) require UI approval before healing
-# Lower value = more infections show as severe in the UI (severity scale 0-10)
-SEVERITY_REQUIRING_APPROVAL = 7.0
+# Infections with max_deviation >= this threshold require UI approval before
+# healing.  Lower value = more infections need manual approval.
+DEVIATION_REQUIRING_APPROVAL = 5.0
 
 # Delay between healing steps so UI can show "healing in progress"
 HEALING_STEP_DELAY_SECONDS = 1.5
@@ -38,19 +38,28 @@ DRAIN_TIMEOUT_SECONDS = 120
 class ImmuneSystemOrchestrator:
     """Coordinates all immune system components"""
     
-    def __init__(self, agents: List[BaseAgent], store=None):
+    def __init__(self, agents: List[BaseAgent], store=None, cache=None):
         self.agents = {agent.agent_id: agent for agent in agents}
         self.store = store
+        self.cache = cache
         
         # Initialize components
         self.telemetry = TelemetryCollector(store=store)
-        self.baseline_learner = BaselineLearner(min_samples=15, store=store)
+        self.baseline_learner = BaselineLearner(min_samples=15, store=store, cache=cache)
         self.sentinel = Sentinel(threshold_stddev=2.5)
         self.diagnostician = Diagnostician()
         self.quarantine = QuarantineController()
         self.immune_memory = ImmuneMemory(store=store)
         self.healer = Healer(self.telemetry, self.baseline_learner, self.sentinel)
         self.chaos = ChaosInjector()
+
+        if cache:
+            cached_q = cache.get_quarantine()
+            for aid in cached_q:
+                if aid in self.agents:
+                    self.quarantine.quarantine(aid)
+                    self.agents[aid].quarantine()
+                    logger.info("Restored quarantine for %s from cache", aid)
         
         # Statistics
         self.total_infections = 0
@@ -103,7 +112,7 @@ class ImmuneSystemOrchestrator:
     def _serialize_infection(infection: InfectionReport) -> Dict[str, Any]:
         return {
             "agent_id": infection.agent_id,
-            "severity": infection.severity,
+            "max_deviation": infection.max_deviation,
             "anomalies": [a.value for a in infection.anomalies],
             "deviations": infection.deviations,
         }
@@ -114,7 +123,7 @@ class ImmuneSystemOrchestrator:
         base = payload or {}
         if not base and fallback:
             base = {
-                "severity": fallback.get("severity", 0.0),
+                "max_deviation": fallback.get("max_deviation", 0.0),
                 "anomalies": fallback.get("anomalies", []),
                 "deviations": {},
             }
@@ -129,7 +138,7 @@ class ImmuneSystemOrchestrator:
 
         return InfectionReport(
             agent_id=agent_id,
-            severity=float(base.get("severity", 0.0) or 0.0),
+            max_deviation=float(base.get("max_deviation", 0.0) or 0.0),
             anomalies=anomalies,
             deviations=base.get("deviations", {}) or {},
         )
@@ -140,6 +149,9 @@ class ImmuneSystemOrchestrator:
         self.quarantine.release(agent_id)
         agent.release()
         self._quarantine_counter.add(1, attributes={"agent_id": agent_id, "action": "release"})
+        if self.cache:
+            self.cache.remove_quarantine(agent_id)
+            self.cache.save_if_dirty()
         if self.store:
             self.store.write_quarantine_event(agent_id=agent_id, action="release", duration_s=duration)
 
@@ -151,20 +163,20 @@ class ImmuneSystemOrchestrator:
 
         infection_type = (agent.infection_type or "").lower()
         anomalies: List[AnomalyType]
-        severity: float
+        max_dev: float
 
         if infection_type in ("token_explosion", "prompt_drift"):
             anomalies = [AnomalyType.TOKEN_SPIKE]
-            severity = 7.2 if infection_type == "prompt_drift" else 6.8
+            max_dev = 6.0 if infection_type == "prompt_drift" else 4.5
         elif infection_type == "tool_loop":
             anomalies = [AnomalyType.TOOL_EXPLOSION]
-            severity = 7.0
+            max_dev = 5.5
         elif infection_type == "latency_spike":
             anomalies = [AnomalyType.LATENCY_SPIKE]
-            severity = 6.5
+            max_dev = 4.0
         elif infection_type in ("high_retry_rate", "memory_corruption"):
             anomalies = [AnomalyType.HIGH_RETRY_RATE]
-            severity = 6.7 if infection_type == "memory_corruption" else 6.2
+            max_dev = 4.5 if infection_type == "memory_corruption" else 3.5
         elif infection_type == "full_meltdown":
             anomalies = [
                 AnomalyType.LATENCY_SPIKE,
@@ -172,13 +184,13 @@ class ImmuneSystemOrchestrator:
                 AnomalyType.TOOL_EXPLOSION,
                 AnomalyType.HIGH_RETRY_RATE,
             ]
-            severity = 9.0
+            max_dev = 8.0
         else:
             anomalies = [AnomalyType.HIGH_RETRY_RATE]
-            severity = 6.0
+            max_dev = 3.5
 
-        deviations = {a.value: severity for a in anomalies}
-        return InfectionReport(agent_id=agent.agent_id, severity=severity, anomalies=anomalies, deviations=deviations)
+        deviations = {a.value: max_dev for a in anomalies}
+        return InfectionReport(agent_id=agent.agent_id, max_deviation=max_dev, anomalies=anomalies, deviations=deviations)
     
     async def run_agent_loop(self, agent: BaseAgent):
         """Continuously run an agent and emit telemetry on a 1s tick (synced with UI poll)."""
@@ -193,13 +205,18 @@ class ImmuneSystemOrchestrator:
             vitals = await agent.execute()
             self.telemetry.record(vitals)
 
-            # Check if baseline ready to learn
-            count = self.telemetry.get_count(agent.agent_id)
-            if self.baseline_learner.is_baseline_ready(agent.agent_id, count):
-                all_vitals = self.telemetry.get_all(agent.agent_id)
-                baseline = self.baseline_learner.learn_baseline(agent.agent_id, all_vitals)
-                if baseline:
-                    logger.info("Baseline learned for %s: %s", agent.agent_id, baseline)
+            # Feed into EWMA baseline learner (continuously adapts)
+            from .telemetry import AgentVitals
+            v = AgentVitals(
+                timestamp=vitals['timestamp'], agent_id=vitals['agent_id'],
+                agent_type=vitals['agent_type'], latency_ms=vitals['latency_ms'],
+                token_count=vitals.get('token_count', 0), tool_calls=vitals['tool_calls'],
+                retries=vitals['retries'], success=vitals['success'],
+                input_tokens=vitals.get('input_tokens', 0), output_tokens=vitals.get('output_tokens', 0),
+                cost=vitals.get('cost', 0.0), model=vitals.get('model', ''),
+                error_type=vitals.get('error_type', ''), prompt_hash=vitals.get('prompt_hash', ''),
+            )
+            self.baseline_learner.update(agent.agent_id, v)
 
             # Align to 1s tick so UI (polling every 1s) sees consistent backend state
             elapsed = time.time() - tick_start
@@ -253,32 +270,35 @@ class ImmuneSystemOrchestrator:
                         1,
                         attributes={
                             "agent_id": agent_id,
-                            "severity_band": "severe" if infection.severity >= SEVERITY_REQUIRING_APPROVAL else "mild",
+                            "deviation_band": "severe" if infection.max_deviation >= DEVIATION_REQUIRING_APPROVAL else "mild",
                         },
                     )
 
                     anomaly_names = ", ".join(a.value for a in infection.anomalies)
                     logger.warning(
-                        "INFECTION DETECTED: %s | severity=%.1f/10 | anomalies=[%s]",
-                        agent_id, infection.severity, anomaly_names,
+                        "INFECTION DETECTED: %s | max_dev=%.2fσ | anomalies=[%s]",
+                        agent_id, infection.max_deviation, anomaly_names,
                     )
 
                     # Quarantine immediately
                     self.quarantine.quarantine(agent_id)
                     agent.quarantine()
                     self._quarantine_counter.add(1, attributes={"agent_id": agent_id, "action": "enter"})
+                    if self.cache:
+                        self.cache.add_quarantine(agent_id)
+                        self.cache.save_if_dirty()
                     if self.store:
                         self.store.write_quarantine_event(agent_id=agent_id, action="enter")
                     logger.warning("Agent %s QUARANTINED", agent_id)
 
-                    # Severe infections require UI approval before healing
-                    if infection.severity >= SEVERITY_REQUIRING_APPROVAL:
+                    # High-deviation infections require UI approval before healing
+                    if infection.max_deviation >= DEVIATION_REQUIRING_APPROVAL:
                         diagnosis = self.diagnostician.diagnose(infection, baseline)
                         if self.store:
                             payload = self._serialize_infection(infection)
                             self.store.write_infection_event(
                                 agent_id=agent_id,
-                                severity=infection.severity,
+                                max_deviation=infection.max_deviation,
                                 anomalies=payload["anomalies"],
                                 deviations=payload["deviations"],
                                 diagnosis_type=diagnosis.diagnosis_type.value,
@@ -286,7 +306,7 @@ class ImmuneSystemOrchestrator:
                             self.store.write_approval_event(
                                 agent_id=agent_id,
                                 decision="pending",
-                                severity=infection.severity,
+                                max_deviation=infection.max_deviation,
                                 anomalies=payload["anomalies"],
                                 diagnosis_type=diagnosis.diagnosis_type.value,
                                 reasoning=diagnosis.reasoning,
@@ -300,10 +320,10 @@ class ImmuneSystemOrchestrator:
                                     'requested_at': time.time()
                                 }
                         self._approval_counter.add(1, attributes={"decision": "requested", "agent_id": agent_id})
-                        self._log_action("approval_requested", agent_id, severity=round(infection.severity, 1))
+                        self._log_action("approval_requested", agent_id, max_deviation=round(infection.max_deviation, 2))
                         logger.info(
-                            "Agent %s requires approval (severity %.1f) - use dashboard to Approve/Reject",
-                            agent_id, infection.severity,
+                            "Agent %s requires approval (max_dev=%.2fσ) - use dashboard to Approve/Reject",
+                            agent_id, infection.max_deviation,
                         )
                     else:
                         # Auto-heal for non-severe
@@ -323,7 +343,7 @@ class ImmuneSystemOrchestrator:
                 diag = data['diagnosis']
                 out.append({
                     'agent_id': agent_id,
-                    'severity': round(inf.severity, 1),
+                    'max_deviation': round(inf.max_deviation, 2),
                     'anomalies': [a.value for a in inf.anomalies],
                     'diagnosis_type': diag.diagnosis_type.value,
                     'reasoning': diag.reasoning,
@@ -352,7 +372,7 @@ class ImmuneSystemOrchestrator:
                     self.store.write_approval_event(
                         agent_id=agent_id,
                         decision="approved",
-                        severity=latest.get("severity"),
+                        max_deviation=latest.get("max_deviation"),
                         anomalies=latest.get("anomalies"),
                         diagnosis_type=latest.get("diagnosis_type"),
                         reasoning=latest.get("reasoning"),
@@ -365,7 +385,7 @@ class ImmuneSystemOrchestrator:
                 self.store.write_approval_event(
                     agent_id=agent_id,
                     decision="rejected",
-                    severity=latest.get("severity"),
+                    max_deviation=latest.get("max_deviation"),
                     anomalies=latest.get("anomalies"),
                     diagnosis_type=latest.get("diagnosis_type"),
                     reasoning=latest.get("reasoning"),
@@ -422,7 +442,7 @@ class ImmuneSystemOrchestrator:
                 diag = data['diagnosis']
                 out.append({
                     'agent_id': agent_id,
-                    'severity': round(inf.severity, 1),
+                    'max_deviation': round(inf.max_deviation, 2),
                     'anomalies': [a.value for a in inf.anomalies],
                     'diagnosis_type': diag.diagnosis_type.value,
                     'reasoning': diag.reasoning,
@@ -447,7 +467,7 @@ class ImmuneSystemOrchestrator:
                 self.store.write_approval_event(
                     agent_id=agent_id,
                     decision="heal_now",
-                    severity=latest.get("severity"),
+                    max_deviation=latest.get("max_deviation"),
                     anomalies=latest.get("anomalies"),
                     diagnosis_type=latest.get("diagnosis_type"),
                     reasoning=latest.get("reasoning"),

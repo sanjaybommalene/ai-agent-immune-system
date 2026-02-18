@@ -130,7 +130,7 @@ class ApiStore:
     def write_infection_event(
         self,
         agent_id: str,
-        severity: float,
+        max_deviation: float,
         anomalies: List[str],
         deviations: Dict[str, Any],
         diagnosis_type: str,
@@ -139,7 +139,7 @@ class ApiStore:
             "/api/v1/events/infection",
             json={
                 "agent_id": agent_id,
-                "severity": severity,
+                "max_deviation": max_deviation,
                 "anomalies": anomalies,
                 "deviations": deviations,
                 "diagnosis_type": diagnosis_type,
@@ -163,7 +163,7 @@ class ApiStore:
         self,
         agent_id: str,
         decision: str,
-        severity: Optional[float] = None,
+        max_deviation: Optional[float] = None,
         anomalies: Optional[List[str]] = None,
         diagnosis_type: Optional[str] = None,
         reasoning: Optional[str] = None,
@@ -174,7 +174,7 @@ class ApiStore:
             json={
                 "agent_id": agent_id,
                 "decision": decision,
-                "severity": severity,
+                "max_deviation": max_deviation,
                 "anomalies": anomalies,
                 "diagnosis_type": diagnosis_type,
                 "reasoning": reasoning,

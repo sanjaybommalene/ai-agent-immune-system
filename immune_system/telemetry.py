@@ -3,10 +3,12 @@ Telemetry Collection - Store and query agent vitals
 """
 from dataclasses import dataclass
 from typing import List, Dict, Optional
-from collections import defaultdict
+from collections import defaultdict, deque
 import time
 
 from opentelemetry import metrics
+
+_MAX_IN_MEMORY_SAMPLES = 500
 
 
 @dataclass
@@ -33,7 +35,7 @@ class TelemetryCollector:
     
     def __init__(self, store=None):
         self.store = store
-        self.data: Dict[str, List[AgentVitals]] = defaultdict(list)
+        self.data: Dict[str, deque] = defaultdict(lambda: deque(maxlen=_MAX_IN_MEMORY_SAMPLES))
         self._total_executions = 0
 
         meter = metrics.get_meter("immune-system.telemetry")
@@ -108,7 +110,7 @@ class TelemetryCollector:
         if self.store:
             rows = self.store.get_all_agent_vitals(agent_id)
             return [AgentVitals(**row) for row in rows]
-        return self.data.get(agent_id, [])
+        return list(self.data.get(agent_id, []))
     
     def get_count(self, agent_id: str) -> int:
         """Get number of executions for an agent"""

@@ -14,10 +14,11 @@ logger = get_logger("web_dashboard")
 class WebDashboard:
     """Web dashboard for real-time monitoring"""
 
-    def __init__(self, orchestrator, port=8090):
+    def __init__(self, orchestrator, port=8090, api_key: str = ""):
         self.orchestrator = orchestrator
         self.port = port
-        self._loop = None  # Set from main() for thread-safe heal scheduling
+        self._loop = None
+        self._api_key = api_key
         self.app = Flask(__name__)
         CORS(self.app)
 
@@ -166,6 +167,17 @@ class WebDashboard:
             'rejected_count': 0 if approved else pending_count,
         })
 
+    # ---- Auth helper ----
+
+    def _check_api_key(self):
+        """Return an error response if the API key is invalid, else None."""
+        if not self._api_key:
+            return None
+        provided = request.headers.get("X-API-KEY", "")
+        if provided == self._api_key:
+            return None
+        return jsonify({"ok": False, "error": "Invalid or missing API key"}), 401
+
     # ---- External agent integration endpoints ----
 
     def post_ingest(self):
@@ -174,14 +186,44 @@ class WebDashboard:
         POST JSON body:
             agent_id (required), agent_type, latency_ms, input_tokens,
             output_tokens, token_count, tool_calls, retries, success,
-            cost, model, error_type, prompt_hash.
+            cost, model, error_type, prompt_hash, timestamp.
+        Requires X-API-KEY header.
         """
+        auth_err = self._check_api_key()
+        if auth_err:
+            return auth_err
+
         data = request.get_json(silent=True) or {}
         agent_id = data.get('agent_id')
-        if not agent_id:
-            return jsonify({'ok': False, 'error': 'agent_id is required'}), 400
+        if not agent_id or not isinstance(agent_id, str):
+            return jsonify({'ok': False, 'error': 'agent_id (string) is required'}), 400
 
-        # Auto-register unknown agents so external agents don't need a separate call
+        # Type and range validation
+        try:
+            latency_ms = int(data.get('latency_ms', 0))
+            input_tokens = int(data.get('input_tokens', 0))
+            output_tokens = int(data.get('output_tokens', 0))
+            token_count = int(data.get('token_count', 0)) or (input_tokens + output_tokens)
+            tool_calls = int(data.get('tool_calls', 0))
+            retries = int(data.get('retries', 0))
+            cost = float(data.get('cost', 0.0))
+        except (ValueError, TypeError) as e:
+            return jsonify({'ok': False, 'error': f'Invalid field type: {e}'}), 400
+
+        if latency_ms < 0 or token_count < 0 or tool_calls < 0 or cost < 0:
+            return jsonify({'ok': False, 'error': 'Numeric fields must be non-negative'}), 400
+
+        ts = data.get('timestamp', time.time())
+        try:
+            ts = float(ts)
+        except (ValueError, TypeError):
+            ts = time.time()
+        now = time.time()
+        if ts > now + 300:
+            return jsonify({'ok': False, 'error': 'Timestamp is too far in the future (>5 min)'}), 400
+        if ts < now - 3600:
+            return jsonify({'ok': False, 'error': 'Timestamp is too old (>1 hour)'}), 400
+
         if agent_id not in self.orchestrator.agents:
             from .agents import BaseAgent
             agent = BaseAgent(
@@ -191,25 +233,21 @@ class WebDashboard:
             )
             self.orchestrator.agents[agent_id] = agent
 
-        input_tokens = int(data.get('input_tokens', 0))
-        output_tokens = int(data.get('output_tokens', 0))
-        token_count = int(data.get('token_count', 0)) or (input_tokens + output_tokens)
-
         vitals_dict = {
             'agent_id': agent_id,
             'agent_type': data.get('agent_type', 'external'),
-            'latency_ms': int(data.get('latency_ms', 0)),
+            'latency_ms': latency_ms,
             'token_count': token_count,
             'input_tokens': input_tokens,
             'output_tokens': output_tokens,
-            'cost': float(data.get('cost', 0.0)),
-            'tool_calls': int(data.get('tool_calls', 0)),
-            'retries': int(data.get('retries', 0)),
+            'cost': cost,
+            'tool_calls': tool_calls,
+            'retries': retries,
             'success': bool(data.get('success', True)),
             'model': data.get('model', ''),
             'error_type': data.get('error_type', ''),
             'prompt_hash': data.get('prompt_hash', ''),
-            'timestamp': data.get('timestamp', time.time()),
+            'timestamp': ts,
         }
         self.orchestrator.telemetry.record(vitals_dict)
         return jsonify({'ok': True})
@@ -218,7 +256,12 @@ class WebDashboard:
         """Register an external agent with the immune system.
 
         POST JSON body: agent_id (required), agent_type, model.
+        Requires X-API-KEY header.
         """
+        auth_err = self._check_api_key()
+        if auth_err:
+            return auth_err
+
         data = request.get_json(silent=True) or {}
         agent_id = data.get('agent_id')
         if not agent_id:
@@ -1100,7 +1143,7 @@ HTML_TEMPLATE = """
                 <div class="pending-approval-card" data-agent-id="${p.agent_id}">
                     <div class="info">
                         <div class="agent-id">${p.agent_id}</div>
-                        <div>Severity: ${p.severity}/10 · ${p.diagnosis_type}</div>
+                        <div>Deviation: ${(p.max_deviation != null ? p.max_deviation : 0).toFixed(1)}σ · ${p.diagnosis_type}</div>
                         <div class="meta">${p.anomalies.join(', ')}</div>
                         <div class="meta" style="margin-top: 4px;">${p.reasoning}</div>
                     </div>
@@ -1144,7 +1187,7 @@ HTML_TEMPLATE = """
                 <div class="pending-approval-card rejected-card">
                     <div class="info">
                         <div class="agent-id">${p.agent_id}</div>
-                        <div>Severity: ${p.severity}/10 · ${p.diagnosis_type}</div>
+                        <div>Deviation: ${(p.max_deviation != null ? p.max_deviation : 0).toFixed(1)}σ · ${p.diagnosis_type}</div>
                         <div class="meta">${p.anomalies.join(', ')}</div>
                     </div>
                     <button class="btn-retry" onclick="healExplicitly('${p.agent_id}')">Heal now</button>
@@ -1227,7 +1270,7 @@ HTML_TEMPLATE = """
             switch (h.type) {
                 case 'approval_requested':
                     return { rowClass: 'approval-requested', html: `
-                        <div><strong>${agent}</strong>: Approval requested (severity ${h.severity}/10)</div>
+                        <div><strong>${agent}</strong>: Approval requested (${(h.max_deviation != null ? h.max_deviation : 0).toFixed(1)}σ)</div>
                         <div style="font-size: 0.8em; color: #666;">⏸️ Awaiting user decision</div>
                     `, badge: '⏸️ Pending' };
                 case 'user_approved':

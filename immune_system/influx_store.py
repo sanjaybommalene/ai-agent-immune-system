@@ -1,7 +1,14 @@
 """
 InfluxDB-backed storage for telemetry, baselines, workflow state, and healing memory.
+
+Writes go through a bounded WriteBuffer (background thread, batched, with retry).
+Reads remain synchronous since they are infrequent.
 """
 import json
+import logging
+import queue
+import random
+import threading
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -10,9 +17,82 @@ from uuid import uuid4
 from influxdb_client import InfluxDBClient, Point, WritePrecision
 from influxdb_client.client.write_api import SYNCHRONOUS
 
+_log = logging.getLogger("influx_store")
+
+_BATCH_SIZE = 50
+_BUFFER_MAX = 1000
+_FLUSH_INTERVAL = 0.5  # seconds
+_MAX_RETRIES = 3
+
+
+class _WriteBuffer:
+    """Background thread that drains a bounded queue and writes to InfluxDB in batches."""
+
+    def __init__(self, write_api, bucket: str, org: str):
+        self._write_api = write_api
+        self._bucket = bucket
+        self._org = org
+        self._queue: queue.Queue = queue.Queue(maxsize=_BUFFER_MAX)
+        self._thread = threading.Thread(target=self._drain_loop, daemon=True)
+        self._thread.start()
+
+    def enqueue(self, point: Point):
+        try:
+            self._queue.put_nowait(point)
+        except queue.Full:
+            _log.warning("Write buffer full (%d) — dropping oldest point", _BUFFER_MAX)
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._queue.put_nowait(point)
+            except queue.Full:
+                pass
+
+    def _drain_loop(self):
+        while True:
+            batch: List[Point] = []
+            try:
+                first = self._queue.get(timeout=_FLUSH_INTERVAL)
+                batch.append(first)
+            except queue.Empty:
+                continue
+
+            while len(batch) < _BATCH_SIZE:
+                try:
+                    batch.append(self._queue.get_nowait())
+                except queue.Empty:
+                    break
+
+            self._write_with_retry(batch)
+
+    def _write_with_retry(self, batch: List[Point]):
+        for attempt in range(_MAX_RETRIES):
+            try:
+                self._write_api.write(bucket=self._bucket, org=self._org, record=batch)
+                return
+            except Exception as exc:
+                sleep_time = (2 ** attempt) + random.random() * 0.5
+                _log.warning("InfluxDB write failed (attempt %d/%d): %s — retrying in %.1fs",
+                             attempt + 1, _MAX_RETRIES, exc, sleep_time)
+                time.sleep(sleep_time)
+        _log.error("InfluxDB write failed after %d attempts — %d points dropped", _MAX_RETRIES, len(batch))
+
+    def flush(self):
+        """Drain any remaining items (best-effort, for shutdown)."""
+        remaining: List[Point] = []
+        while not self._queue.empty():
+            try:
+                remaining.append(self._queue.get_nowait())
+            except queue.Empty:
+                break
+        if remaining:
+            self._write_with_retry(remaining)
+
 
 class InfluxStore:
-    """Thin synchronous wrapper around InfluxDB for POC-scale workloads."""
+    """InfluxDB store with async batched writes and retry."""
 
     def __init__(self, url: str, token: str, org: str, bucket: str, run_id: Optional[str] = None):
         self.url = url
@@ -22,8 +102,9 @@ class InfluxStore:
         self.run_id = run_id or f"run-{uuid4().hex[:12]}"
 
         self.client = InfluxDBClient(url=url, token=token, org=org)
-        self.write_api = self.client.write_api(write_options=SYNCHRONOUS)
+        self._sync_write_api = self.client.write_api(write_options=SYNCHRONOUS)
         self.query_api = self.client.query_api()
+        self._buffer = _WriteBuffer(self._sync_write_api, bucket, org)
 
     def _write(self, measurement: str, tags: Dict[str, str], fields: Dict[str, Any], timestamp: Optional[float] = None):
         point = Point(measurement)
@@ -46,7 +127,7 @@ class InfluxStore:
 
         ts = timestamp if timestamp is not None else time.time()
         point.time(datetime.fromtimestamp(ts, tz=timezone.utc), WritePrecision.NS)
-        self.write_api.write(bucket=self.bucket, org=self.org, record=point)
+        self._buffer.enqueue(point)
 
     def _query(self, flux: str):
         return self.query_api.query(flux, org=self.org)
@@ -169,7 +250,6 @@ from(bucket: "{self.bucket}")
 
     def write_baseline_profile(self, profile: Dict[str, Any]):
         fields = {
-            # Keep numeric schema stable in InfluxDB (always float for metric stats).
             "latency_mean": float(profile["latency_mean"]),
             "latency_stddev": float(profile["latency_stddev"]),
             "latency_p95": float(profile["latency_p95"]),
@@ -189,6 +269,7 @@ from(bucket: "{self.bucket}")
             "cost_mean": float(profile.get("cost_mean", 0.0)),
             "cost_stddev": float(profile.get("cost_stddev", 0.0)),
             "cost_p95": float(profile.get("cost_p95", 0.0)),
+            "prompt_hash": str(profile.get("prompt_hash", "")),
         }
         self._write(
             measurement="baseline_profile",
@@ -231,6 +312,7 @@ from(bucket: "{self.bucket}")
                     "cost_stddev": float(values.get("cost_stddev", 0.0) or 0.0),
                     "cost_p95": float(values.get("cost_p95", 0.0) or 0.0),
                     "sample_size": int(values.get("sample_size", 0) or 0),
+                    "prompt_hash": str(values.get("prompt_hash", "") or ""),
                 }
         return None
 
@@ -251,12 +333,12 @@ from(bucket: "{self.bucket}")
 
     # -------- Infection / Quarantine events --------
 
-    def write_infection_event(self, agent_id: str, severity: float, anomalies: List[str], deviations: Dict[str, Any], diagnosis_type: str):
+    def write_infection_event(self, agent_id: str, max_deviation: float, anomalies: List[str], deviations: Dict[str, Any], diagnosis_type: str):
         self._write(
             measurement="infection_event",
             tags={"agent_id": agent_id, "diagnosis_type": diagnosis_type},
             fields={
-                "severity": float(severity),
+                "max_deviation": float(max_deviation),
                 "anomalies_json": json.dumps(anomalies),
                 "deviations_json": json.dumps(deviations),
                 "marker": 1,
@@ -278,7 +360,7 @@ from(bucket: "{self.bucket}")
         self,
         agent_id: str,
         decision: str,
-        severity: Optional[float] = None,
+        max_deviation: Optional[float] = None,
         anomalies: Optional[List[str]] = None,
         diagnosis_type: Optional[str] = None,
         reasoning: Optional[str] = None,
@@ -289,7 +371,7 @@ from(bucket: "{self.bucket}")
             tags={"agent_id": agent_id, "decision": decision},
             fields={
                 "marker": 1,
-                "severity": severity,
+                "max_deviation": max_deviation,
                 "anomalies_json": json.dumps(anomalies) if anomalies is not None else None,
                 "diagnosis_type": diagnosis_type,
                 "reasoning": reasoning,
@@ -319,7 +401,7 @@ from(bucket: "{self.bucket}")
                 latest_by_agent[agent_id] = {
                     "agent_id": agent_id,
                     "decision": values.get("decision"),
-                    "severity": float(values.get("severity", 0.0) or 0.0),
+                    "max_deviation": float(values.get("max_deviation", 0.0) or 0.0),
                     "anomalies": self._safe_json_loads(values.get("anomalies_json"), []),
                     "diagnosis_type": values.get("diagnosis_type", "unknown"),
                     "reasoning": values.get("reasoning", ""),
@@ -336,7 +418,7 @@ from(bucket: "{self.bucket}")
         return [
             {
                 "agent_id": v["agent_id"],
-                "severity": round(v["severity"], 1),
+                "max_deviation": round(v["max_deviation"], 2),
                 "anomalies": v["anomalies"],
                 "diagnosis_type": v["diagnosis_type"],
                 "reasoning": v["reasoning"],
@@ -351,7 +433,7 @@ from(bucket: "{self.bucket}")
         return [
             {
                 "agent_id": v["agent_id"],
-                "severity": round(v["severity"], 1),
+                "max_deviation": round(v["max_deviation"], 2),
                 "anomalies": v["anomalies"],
                 "diagnosis_type": v["diagnosis_type"],
                 "reasoning": v["reasoning"],
@@ -466,7 +548,7 @@ from(bucket: "{self.bucket}")
     def write_action_log(self, action_type: str, agent_id: str, payload: Dict[str, Any]):
         fields = {
             "marker": 1,
-            "severity": payload.get("severity"),
+            "max_deviation": payload.get("max_deviation"),
             "diagnosis_type": payload.get("diagnosis_type"),
             "action": payload.get("action"),
             "success": int(bool(payload.get("success"))) if payload.get("success") is not None else None,
@@ -499,7 +581,7 @@ from(bucket: "{self.bucket}")
                         "type": values.get("type"),
                         "agent_id": values.get("agent_id"),
                         "timestamp": record.get_time().timestamp() if record.get_time() else time.time(),
-                        "severity": float(values.get("severity")) if values.get("severity") is not None else None,
+                        "max_deviation": float(values.get("max_deviation")) if values.get("max_deviation") is not None else None,
                         "diagnosis_type": values.get("diagnosis_type"),
                         "action": values.get("action"),
                         "success": bool(int(success_raw)) if success_raw is not None else None,

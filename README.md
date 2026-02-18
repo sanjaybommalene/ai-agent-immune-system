@@ -1,6 +1,6 @@
 # AI Agent Immune System
 
-The AI Agent Immune System is a control plane for autonomous AI agents that continuously monitors their behavior, detects anomalies, quarantines unhealthy agents, and heals them using policy-driven actions with optional human-in-the-loop approval for high-severity cases.
+The AI Agent Immune System is a **control plane** (a management layer that monitors and governs other systems) for autonomous AI agents. It continuously monitors their behavior, detects anomalies, quarantines unhealthy agents, and heals them using policy-driven actions with optional human-in-the-loop approval for high-deviation cases.
 
 The system learns per-agent baselines, correlates anomalies into diagnoses, and maintains an immune memory so that failed healing actions are not repeated—improving stability and reducing operator load as the number of agents scales.
 
@@ -12,17 +12,18 @@ The system learns per-agent baselines, correlates anomalies into diagnoses, and 
 
 ### Problem
 
-Autonomous AI agents (e.g. those backed by models like GPT-5 or Claude and tools exposed via MCP) can exhibit unhealthy behavior: prompt drift, token explosions, tool-call loops, latency spikes, or high retry rates. Without a structured response, such behavior can cascade, and manual intervention does not scale.
+Autonomous AI agents (e.g. those backed by models like GPT-5 or Claude and tools exposed via MCP — Model Context Protocol) can exhibit unhealthy behavior: prompt drift, token explosions, tool-call loops, latency spikes, or high retry rates. Without a structured response, such behavior can cascade, and manual intervention does not scale.
 
 ### Approach
 
 The system treats agents as managed entities with an *immune system*:
 
-- **Baseline learning:** Each agent's normal behavior (latency, tokens, input/output tokens, cost, tool calls, retries, prompt hash) is learned from vitals so that anomalies are judged relative to that agent, not a single global threshold.
-- **Anomaly detection:** A sentinel compares recent vitals to the baseline and flags infections with a severity score (0–10). Anomaly types: token spike, latency spike, tool explosion, high retry rate, input/output token spike, cost spike, prompt change, error rate spike.
+- **Baseline learning:** Each agent's normal behavior (latency, tokens, input/output tokens, cost, tool calls, retries, prompt hash) is learned from **vitals** (health metrics emitted after each task, analogous to a patient's vital signs) so that anomalies are judged relative to that agent, not a single global threshold.
+- **Anomaly detection:** A sentinel compares recent vitals to the baseline and flags infections with a deviation score (in σ — standard deviations from normal baseline). Anomaly types: token spike, latency spike, tool explosion, high retry rate, input/output token spike, cost spike, prompt change, error rate spike.
 - **Containment:** Infected agents are quarantined immediately so they no longer affect the rest of the system.
-- **Human-in-the-loop for severe cases:** Infections above a configurable severity threshold require explicit Approve or Reject in the web dashboard before healing runs. Rejected agents remain quarantined until an operator chooses "Heal now" (per agent or "Heal all").
-- **Policy-driven healing:** For each diagnosis type (e.g. prompt drift, prompt injection, infinite loop, tool instability), a fixed *healing policy* defines an ordered list of actions (e.g. reset memory, rollback prompt, reduce autonomy, revoke tools, clone agent). The healer tries actions in order; immune memory records successes and failures and skips actions that have already failed for that agent and diagnosis.
+- **Human-in-the-loop for severe cases:** Infections above a configurable deviation threshold (default 5.0σ) require explicit Approve or Reject in the web dashboard before healing runs. Rejected agents remain quarantined until an operator chooses "Heal now" (per agent or "Heal all").
+- **Policy-driven healing:** For each diagnosis type (e.g. prompt drift, prompt injection, infinite loop, tool instability), a fixed *healing policy* defines an ordered list of actions (e.g. reset memory, rollback prompt, reduce autonomy, revoke tools, reset agent). The healer tries actions in order; immune memory records successes and failures and skips actions that have already failed for that agent and diagnosis.
+- **Restart resilience:** A local cache (`CacheManager`) persists EWMA (Exponential Weighted Moving Average) baselines, quarantine state, run identity, and API key across restarts — no cold-start delay (the period after restart where the system has to re-learn baselines before it can detect anomalies) or state loss.
 - **Adaptive learning:** Immune memory is used across the fleet so the system converges toward actions that work and avoids repeating known failures.
 
 The web dashboard provides a single pane of glass: agent status (with model and MCP labels), pending and rejected approvals, bulk actions (Approve all, Reject all, Heal all), recent healing actions, and learned patterns.
@@ -31,11 +32,12 @@ The web dashboard provides a single pane of glass: agent status (with model and 
 
 - **External agent integration:** Real AI agents (any language) can report vitals via `POST /api/v1/ingest`. Python agents can use the lightweight `immune_sdk.py` (`ImmuneReporter`) which wraps the HTTP API. Unknown agents are auto-registered on first report. See `docs/DOCS.md` §2.6.
 - **Server API store (optional):** When `SERVER_API_BASE_URL` is set, the client uses **ApiStore** and talks to a server REST API for all persistence (client-deployed architecture). No direct InfluxDB on the client. See `docs/DOCS.md` (§2, §5, §6).
-- **InfluxDB-backed persistence (optional):** When `INFLUXDB_*` environment variables are set (and server API is not), telemetry, baselines, approval workflow state (pending/rejected), immune memory, and the healing action log are stored in InfluxDB. Each run is isolated by a `run_id`. If neither server API nor InfluxDB is configured, the system falls back to in-memory state.
+- **InfluxDB-backed persistence (optional):** InfluxDB is a time-series database well-suited for storing metrics over time. When `INFLUXDB_*` environment variables are set (and server API is not), telemetry, baselines, approval workflow state (pending/rejected), immune memory, and the healing action log are stored in InfluxDB. Each run is isolated by a `run_id`. If neither server API nor InfluxDB is configured, the system falls back to in-memory state.
 - **OpenTelemetry (OTEL) metrics export:** When `OTEL_EXPORTER_OTLP_ENDPOINT` is set, the app exports metrics (counters, histograms) for agent executions, infections, approvals, and quarantine events to an OTLP HTTP endpoint (e.g. an OpenTelemetry Collector). OTEL is the metric *export* format; the primary vitals flow is agents → TelemetryCollector → store.
 - **Structured logging:** Configurable via `LOG_LEVEL` and `LOG_FORMAT` (human-readable colored console or JSON for log aggregation). See `logging_config.py`.
 - **Observability stack:** The `observability/` directory provides a Docker Compose stack (InfluxDB + OTEL Collector) for local demos and development.
 - **Demo entry point:** `demo.py` runs a shorter demo (10 agents, default 600s run duration) with the same InfluxDB/OTEL setup as `main.py`; run length is configurable via `RUN_DURATION_SECONDS`.
+- **Restart-resilient cache:** `CacheManager` (`immune_system/cache.py`) persists EWMA baselines, quarantine set, `run_id`, and ingest API key in a local JSON file (`~/.immune_cache/state.json`). On restart, the system resumes without cold-start baseline warmup or quarantine state loss.
 - **Start script:** `start.sh` sets environment variables and launches `main.py` in one step.
 
 ---
@@ -62,7 +64,7 @@ In such a setting, customers may run:
 | **Controlled remediation** | Severe anomalies require approval before healing, so operators can review diagnosis and decide when to auto-heal vs. investigate or reject. Rejected agents stay quarantined until an explicit "Heal now," avoiding unwanted automatic actions. |
 | **Reduced toil** | Immune memory learns which actions work for which diagnosis types and avoids repeating failed cures. As the fleet grows, healing success rate improves and repeat manual fixes decrease. |
 | **Single pane of glass** | The dashboard shows all agents (with model/MCP context), pending and rejected approvals, and healing history. Approve all / Reject all / Heal all support bulk operations during incidents. |
-| **Safe rollout of agentic AI** | New agent types or MCP integrations can be monitored with learned baselines; human-in-the-loop for high severity keeps critical decisions under operator control while mild cases are healed automatically. |
+| **Safe rollout of agentic AI** | New agent types or MCP integrations can be monitored with learned baselines; human-in-the-loop for high deviation keeps critical decisions under operator control while mild cases are healed automatically. |
 
 This pattern applies beyond Cisco AI PODs: any deployment (on-prem, hybrid, or cloud) that runs multiple autonomous AI agents—whether on Kubernetes, OpenShift, or dedicated inference stacks—can use the immune system as an operational control plane for detection, containment, approval, and healing.
 
@@ -89,6 +91,7 @@ flowchart TB
         Sen[Sentinel] --> Diag[Diagnostician] --> Heal[Healer]
         Sen --> Q[Quarantine]
         Heal --> Mem[Immune Memory]
+        Cache["CacheManager<br/>(local JSON)"]
     end
 ```
 
@@ -101,12 +104,14 @@ This view shows the main components and how they connect (logical architecture).
 flowchart TD
     Agents[Agent sources] -->|vitals| TC[Telemetry]
     TC --> BL[Baseline]
+    BL <-.->|EWMA state| Cache["CacheManager"]
     Orch[Orchestrator] --> Sen[Sentinel]
     Sen --> Diag[Diagnostician]
     Sen --> Q[Quarantine]
-    Q --> Check{Severity?}
-    Check -->|severe| Pending[Pending approval]
-    Check -->|mild| Auto[Auto-heal]
+    Q <-.->|persist| Cache
+    Q --> Check{Deviation?}
+    Check -->|"≥ 5.0σ"| Pending[Pending approval]
+    Check -->|"< 5.0σ"| Auto[Auto-heal]
     Pending --> Heal[Healer]
     Auto --> Heal
     Heal --> IM[Immune Memory]
@@ -129,13 +134,15 @@ flowchart TB
 
     subgraph TelBase ["TELEMETRY + BASELINE"]
         TC["TelemetryCollector<br/>stores vitals per agent"]
-        BL["BaselineLearner<br/>mean/std after ~20 samples"]
+        BL["BaselineLearner<br/>EWMA adaptive after ~15 samples"]
     end
+
+    BL <-.->|"EWMA state / quarantine / run_id"| Cache["CacheManager<br/>(~/.immune_cache/state.json)"]
 
     TelBase --> SEN
 
     subgraph SEN ["SENTINEL (1s loop)"]
-        S["Compare recent vitals to baseline<br/>→ anomalies + severity"]
+        S["Compare recent vitals to baseline<br/>→ anomalies + deviation (σ)"]
     end
 
     SEN --> Severe & Mild
@@ -159,7 +166,7 @@ flowchart TB
         D["Agents · approvals · healing log<br/>Approve / Reject / Heal now"]
     end
 
-    D -->|user action| SEN
+    D -->|"Approve / Reject"| Severe
 
     style sources fill:#e1f5fe,stroke:#0277bd,color:#1a1a1a
     style TelBase fill:#f3e5f5,stroke:#6a1b9a,color:#1a1a1a
@@ -209,16 +216,17 @@ flowchart TB
 |-----------------|-------------------|----------------|
 | Agent runtime   | `immune_system/agents.py` | Multiple agent types (Research, Data, Analytics, Coordinator); each executes on a tick and returns vitals; supports infection simulation and model/MCP-style labels for the UI. |
 | Telemetry       | `immune_system/telemetry.py` | Stores vitals per agent; when a store is configured, uses it for persistence; otherwise in-memory; provides recent window and counts for baseline and sentinel; emits OTEL metrics for export. |
-| Baseline        | `immune_system/baseline.py` | Learns mean and standard deviation per metric per agent after a minimum sample count; can persist/load baselines via store when configured. |
-| Sentinel        | `immune_system/detection.py` | Compares recent vitals to baseline; emits infection report with anomaly types and severity (0–10). |
+| Baseline        | `immune_system/baseline.py` | Learns EWMA (Exponential Weighted Moving Average) baselines per metric per agent after a minimum sample count (~15); persists state via cache for restart resilience. |
+| Sentinel        | `immune_system/detection.py` | Compares recent vitals to baseline; emits infection report with anomaly types and deviation (σ). |
 | Diagnostician   | `immune_system/diagnosis.py` | Maps anomaly patterns to diagnosis types (prompt drift, prompt injection, infinite loop, tool instability, memory corruption). |
-| Healer          | `immune_system/healing.py` | Holds healing policies (diagnosis → ordered actions); applies actions (reset memory, rollback prompt, reduce autonomy, revoke tools, clone agent); consults immune memory to skip failed actions. |
+| Healer          | `immune_system/healing.py` | Holds healing policies (diagnosis → ordered actions); applies actions (reset memory, rollback prompt, reduce autonomy, revoke tools, reset agent); consults immune memory to skip failed actions. |
 | Immune memory   | `immune_system/memory.py` | Records per-agent, per-diagnosis healing outcomes; exposes failed actions and success-rate summaries; can persist via store when configured. |
 | Quarantine      | `immune_system/quarantine.py` | Tracks quarantined agent IDs; quarantine/release used by orchestrator and agent loop. |
 | Chaos           | `immune_system/chaos.py` | Injects token/tool/latency/retry-style failures for demos. |
 | InfluxStore     | `immune_system/influx_store.py` | Optional InfluxDB-backed storage for vitals, baselines, infection/quarantine/approval events, healing memory, and action log; run-scoped by `run_id`. |
 | ApiStore        | `immune_system/api_store.py` | Optional **server API**–backed store: same interface as InfluxStore but calls a remote REST API (used when immune system runs on client and server fronts InfluxDB). Set `SERVER_API_BASE_URL` to enable. |
-| Python SDK      | `immune_sdk.py` | Lightweight reporter for external Python agents; wraps `POST /api/v1/ingest` with auto-registration. |
+| Cache           | `immune_system/cache.py` | Local JSON file cache for restart resilience: persists `run_id`, EWMA baselines, quarantine state, and API key across restarts. |
+| Python SDK      | `immune_sdk.py` | Lightweight reporter for external Python agents; wraps `POST /api/v1/ingest` with auto-registration and API key auth. |
 | Logging         | `immune_system/logging_config.py` | Structured logging: colored console or JSON format; configurable via `LOG_LEVEL` and `LOG_FORMAT`. |
 | Orchestrator    | `immune_system/orchestrator.py` | Holds all of the above; runs agent loops, sentinel loop, and chaos schedule; implements approve/reject/heal-now and approve-all/reject-all/heal-all; exposes state and actions for the dashboard; uses store for workflow state when configured. |
 | Web dashboard   | `immune_system/web_dashboard.py` | Flask app; serves UI and REST endpoints for status, agents, pending/rejected, healing log, stats; exposes `POST /api/v1/ingest` and `POST /api/v1/agents/register` for external agents; triggers healing on the orchestrator's event loop. |
@@ -285,6 +293,25 @@ Use `RUN_DURATION_SECONDS=120` (or similar) for a short demo; `demo.py` defaults
 | `RUN_DURATION_SECONDS` | How long the orchestrator runs. Default: `1200` for `main.py`, `600` for `demo.py`. |
 | `LOG_LEVEL` | Logging level: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` (default: `INFO`). |
 | `LOG_FORMAT` | `text` (colored console) or `json` for log aggregation (default: `text`). |
+| `INGEST_API_KEY` | API key for `POST /api/v1/ingest` and `/api/v1/agents/register`. If not set, auto-generated and cached in `~/.immune_cache/state.json`. |
+| `IMMUNE_CACHE_DIR` | Directory for the local state cache file. Defaults to `~/.immune_cache`. Set to a volume-mounted path in Docker/K8s. |
+
+---
+
+## Deployment Scenarios (Cache Persistence)
+
+The local file cache (`~/.immune_cache/state.json`) stores run ID, EWMA baselines, quarantine list, and API key. How it persists depends on your deployment:
+
+| Scenario | Cache survives? | Notes |
+|---|---|---|
+| Process restart on same host | Yes | File stays on disk. |
+| Docker restart (same container) | Yes | Container filesystem persists across restarts. |
+| Docker with volume mount | Yes | Set `IMMUNE_CACHE_DIR` to the mount path (e.g. `-v /data/immune-cache:/data/immune-cache -e IMMUNE_CACHE_DIR=/data/immune-cache`). |
+| Kubernetes with PVC | Yes | Mount a PersistentVolumeClaim and set `IMMUNE_CACHE_DIR`. |
+| Docker without volume / K8s without PVC | No (graceful degradation) | New `run_id` generated; baselines re-learned from store or from scratch; quarantine re-detected within one sentinel cycle (~1–2 s). |
+| Blue/green deploy | No (graceful degradation) | Same as above — new instance starts fresh. |
+
+When cache is lost, the system degrades gracefully: baselines are recovered from the store (InfluxDB/API) if available, or re-learned after `min_samples` (~15 samples). Quarantine state is the only thing truly lost; the sentinel re-detects anomalies within 1–2 seconds.
 
 ---
 
@@ -303,11 +330,11 @@ Sections are collapsible. All data is read from the orchestrator and refreshed e
 
 ## Behavior Summary
 
-- **Severity:** Derived from deviation of recent vitals from baseline (compressed into 0–10). Higher severity means a larger anomaly.
-- **Severe infections:** When severity is at or above a configurable threshold, the agent is quarantined and added to **pending approvals**. Healing does not start until a user Approves (or Approve all) in the dashboard.
+- **Deviation:** The primary anomaly signal is `max_deviation` (in σ — standard deviations from EWMA baseline). The UI displays deviation in σ (e.g. 5.2σ).
+- **Severe infections:** When `max_deviation` is at or above a configurable threshold (default 5.0σ), the agent is quarantined and added to **pending approvals**. Healing does not start until a user Approves (or Approve all) in the dashboard.
 - **Rejected:** If the user Rejects, the agent remains quarantined and is listed under **Rejected healings**. Healing can be started later via **Heal now** (single or Heal all).
-- **Auto-heal:** When severity is below the threshold, the orchestrator starts healing immediately using the diagnosis, policy ladder, and immune memory.
-- **Healing policy:** Each diagnosis type has an ordered list of actions (e.g. reset memory, rollback prompt, reduce autonomy, revoke tools, clone agent). Immune memory skips actions that have already failed for that agent and diagnosis; the healer escalates to the next until success or exhaustion.
+- **Auto-heal:** When `max_deviation` is below the threshold, the orchestrator starts healing immediately using the diagnosis, policy ladder, and immune memory.
+- **Healing policy:** Each diagnosis type has an ordered list of actions (e.g. reset memory, rollback prompt, reduce autonomy, revoke tools, reset agent). Immune memory skips actions that have already failed for that agent and diagnosis; the healer escalates to the next until success or exhaustion.
 
 ---
 
@@ -321,7 +348,9 @@ Sections are collapsible. All data is read from the orchestrator and refreshed e
 
 ## Further documentation
 
-- **`docs/DOCS.md`** — **Single reference** for everything: executive summary, architecture (client-deployed), integration diagrams (Mermaid), internal design (HLD/LLD/Sequence), healing & deviation (§4), server REST API (§6), client config (§5), InfluxDB schema, alternative deployment, migration, security/SLOs, runtime notes, **operations runbook** (§13: quick start, env vars, health checks, known issues, incident checklist), and one-page summary. Update this doc when anything changes.
+- **`docs/DOCS.md`** — **Single reference** for everything: executive summary, architecture (client-deployed), integration diagrams (Mermaid), internal design (HLD/LLD/Sequence), healing & deviation (§4), server REST API (§6), client config (§5), InfluxDB schema, alternative deployment, migration, security/SLOs, runtime notes, **operations runbook** (§13), **doc/code/test sync** (§15). Update this doc when anything changes.
+- **`docs/PRODUCTION_READINESS.md`** — Production readiness analysis: architect and observability review, gaps (security, resilience, observability, packaging), and prioritized recommendations.
+- **`tests/README.md`** — Test coverage vs DOCS scenarios; which tests cover ApiStore, dashboard, store-backed detection, run_id isolation, immune memory, and Heal now.
 - **`presentation.py`** — Optional: generates a PowerPoint deck (requires `python-pptx`); not part of the runtime.
 
 ---
