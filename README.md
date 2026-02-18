@@ -35,10 +35,12 @@ The web dashboard provides a single pane of glass: agent status (with model and 
 - **InfluxDB-backed persistence (optional):** InfluxDB is a time-series database well-suited for storing metrics over time. When `INFLUXDB_*` environment variables are set (and server API is not), telemetry, baselines, approval workflow state (pending/rejected), immune memory, and the healing action log are stored in InfluxDB. Each run is isolated by a `run_id`. If neither server API nor InfluxDB is configured, the system falls back to in-memory state.
 - **OpenTelemetry (OTEL) metrics export:** When `OTEL_EXPORTER_OTLP_ENDPOINT` is set, the app exports metrics (counters, histograms) for agent executions, infections, approvals, and quarantine events to an OTLP HTTP endpoint (e.g. an OpenTelemetry Collector). OTEL is the metric *export* format; the primary vitals flow is agents → TelemetryCollector → store.
 - **Structured logging:** Configurable via `LOG_LEVEL` and `LOG_FORMAT` (human-readable colored console or JSON for log aggregation). See `logging_config.py`.
-- **Observability stack:** The `observability/` directory provides a Docker Compose stack (InfluxDB + OTEL Collector) for local demos and development.
-- **Demo entry point:** `demo.py` runs a shorter demo (10 agents, default 600s run duration) with the same InfluxDB/OTEL setup as `main.py`; run length is configurable via `RUN_DURATION_SECONDS`.
+- **Observability stack:** The root `docker-compose.yml` provides the full stack (InfluxDB + OTEL Collector + Server API). Use `start-local.sh` to start only InfluxDB + OTEL (no server), or `start-server.sh` for the full stack.
 - **Restart-resilient cache:** `CacheManager` (`immune_system/cache.py`) persists EWMA baselines, quarantine set, `run_id`, and ingest API key in a local JSON file (`~/.immune_cache/state.json`). On restart, the system resumes without cold-start baseline warmup or quarantine state loss.
-- **Start script:** `start.sh` sets environment variables and launches `main.py` in one step.
+- **Start scripts:** `start-local.sh` (direct InfluxDB mode), `start-server.sh` (ApiStore via dockerized server), and `start-gateway.sh` (LLM Gateway mode). `stop.sh` tears down the infrastructure. Run duration is configurable via `RUN_DURATION_SECONDS`.
+- **LLM Gateway (passive observation):** The `gateway/` package provides a reverse proxy that sits between customer AI agents and their LLM providers (OpenAI, Azure OpenAI, etc.). Agents point their `OPENAI_BASE_URL` at the gateway — a single env-var change, no code modification. The gateway passively extracts vitals (tokens, latency, tool calls, cost, prompt hash) from every LLM request/response pair, feeds them into the immune system's detection pipeline, and auto-discovers agents by fingerprinting API keys, IPs, and User-Agents. A policy engine enforces rate limits, model access controls, and token budgets at the proxy layer. See `docs/DOCS.md` §8.
+- **MCP Proxy (optional):** An HTTP/SSE middleware (`gateway/mcp_proxy.py`) observes MCP tool calls between agents and MCP servers, capturing tool names, latency, and errors without modifying traffic.
+- **OTEL Span Processor (optional):** `gateway/otel_processor.py` hooks into existing OpenTelemetry trace pipelines (LangChain, LlamaIndex, OpenLLMetry) and converts `gen_ai.*` spans into immune-system vitals — zero agent code changes if OTEL is already enabled.
 
 ---
 
@@ -74,7 +76,7 @@ This pattern applies beyond Cisco AI PODs: any deployment (on-prem, hybrid, or c
 
 ### System overview
 
-High-level view: agents emit vitals into the immune system, which detects, diagnoses, contains, and recovers, with learning over time.
+High-level view: agents emit vitals into the immune system, which detects, diagnoses, contains, and recovers, with learning over time. The LLM Gateway enables **passive observation** of agents without requiring agent code changes.
 
 ```mermaid
 %%{init: {'theme': 'base', 'themeVariables': {'primaryColor': '#e8eaf6', 'primaryTextColor': '#1a1a1a', 'primaryBorderColor': '#3949ab', 'lineColor': '#37474f', 'secondaryColor': '#f3e5f5', 'tertiaryColor': '#e8f5e9', 'edgeLabelBackground': '#ffffff', 'clusterBkg': '#f5f5f5', 'clusterBorder': '#90a4ae'}}}%%
@@ -83,6 +85,7 @@ flowchart TB
         direction LR
         Sim["Simulated<br/>(in-process)"]
         Ext["External<br/>(HTTP / SDK)"]
+        GW["LLM Gateway<br/>(passive proxy)"]
     end
 
     sources -->|vitals| IS
@@ -93,6 +96,57 @@ flowchart TB
         Heal --> Mem[Immune Memory]
         Cache["CacheManager<br/>(local JSON)"]
     end
+```
+
+### Gateway mode (passive observation)
+
+In gateway mode, the immune system sits between customer agents and their LLM providers. No agent code changes are needed — agents just point their `OPENAI_BASE_URL` at the gateway.
+
+```mermaid
+%%{init: {'theme': 'base', 'themeVariables': {'primaryColor': '#e3f2fd', 'primaryTextColor': '#1a1a1a', 'primaryBorderColor': '#1565c0', 'lineColor': '#37474f', 'secondaryColor': '#fce4ec', 'tertiaryColor': '#e8f5e9', 'edgeLabelBackground': '#ffffff', 'clusterBkg': '#f5f5f5', 'clusterBorder': '#90a4ae'}}}%%
+flowchart LR
+    subgraph agents ["Customer Agents"]
+        A1["LangChain"]
+        A2["CrewAI"]
+        A3["Custom"]
+    end
+
+    subgraph gw ["LLM Gateway (:4000)"]
+        FP["Fingerprinter"]
+        POL["Policy Engine"]
+        PROXY["Reverse Proxy"]
+        EXT["Vitals Extractor"]
+        DISC["Discovery"]
+    end
+
+    subgraph upstream ["LLM Providers"]
+        OAI["OpenAI"]
+        AZ["Azure OpenAI"]
+    end
+
+    subgraph core ["Immune System Core"]
+        TEL["Telemetry"]
+        BL["Baseline"]
+        DET["Sentinel"]
+    end
+
+    A1 --> FP
+    A2 --> FP
+    A3 --> FP
+    FP --> POL
+    POL --> PROXY
+    PROXY --> OAI
+    PROXY --> AZ
+    PROXY --> EXT
+    FP --> DISC
+    EXT --> TEL
+    TEL --> BL
+    BL --> DET
+
+    style agents fill:#e3f2fd,stroke:#1565c0,color:#1a1a1a
+    style gw fill:#fff3e0,stroke:#e65100,color:#1a1a1a
+    style upstream fill:#f3e5f5,stroke:#6a1b9a,color:#1a1a1a
+    style core fill:#e8f5e9,stroke:#2e7d32,color:#1a1a1a
 ```
 
 ### Component architecture
@@ -230,8 +284,15 @@ flowchart TB
 | Logging         | `immune_system/logging_config.py` | Structured logging: colored console or JSON format; configurable via `LOG_LEVEL` and `LOG_FORMAT`. |
 | Orchestrator    | `immune_system/orchestrator.py` | Holds all of the above; runs agent loops, sentinel loop, and chaos schedule; implements approve/reject/heal-now and approve-all/reject-all/heal-all; exposes state and actions for the dashboard; uses store for workflow state when configured. |
 | Web dashboard   | `immune_system/web_dashboard.py` | Flask app; serves UI and REST endpoints for status, agents, pending/rejected, healing log, stats; exposes `POST /api/v1/ingest` and `POST /api/v1/agents/register` for external agents; triggers healing on the orchestrator's event loop. |
-| Entry point     | `main.py`, `demo.py` | `main.py`: full run (15 agents, default 1200s); `demo.py`: shorter run (10 agents, default 600s). Both support InfluxDB/OTEL and configure OTEL metrics when env vars are set. |
-| Start script    | `start.sh` | Sets environment variables and launches `main.py`. |
+| Entry point     | `main.py` | Full run (15 agents, default 1200s). Supports ApiStore, InfluxDB, or in-memory mode; configures OTEL metrics when env vars are set. |
+| Server API      | `server/app.py` | REST bridge between ApiStore clients and InfluxDB; implements all endpoints from DOCS §6. |
+| LLM Gateway     | `gateway/app.py` | Reverse proxy for OpenAI-compatible APIs; passively extracts vitals from LLM request/response pairs. |
+| Fingerprinter   | `gateway/fingerprint.py` | Derives stable agent IDs from API keys, IPs, or custom headers. |
+| Discovery       | `gateway/discovery.py` | Auto-detects and tracks agents as they appear through the gateway. |
+| Policy Engine   | `gateway/policy.py` | Enforces rate limits, model access controls, and token budgets at the proxy layer. |
+| MCP Proxy       | `gateway/mcp_proxy.py` | Optional: observes MCP tool calls between agents and MCP servers. |
+| OTEL Processor  | `gateway/otel_processor.py` | Optional: converts `gen_ai.*` OTEL spans into immune-system vitals. |
+| Start scripts   | `start-local.sh`, `start-server.sh`, `start-gateway.sh`, `stop.sh` | Start infrastructure and client in local, server, or gateway mode; stop tears down containers. |
 
 ---
 
@@ -248,38 +309,64 @@ python main.py
 
 Then open **http://localhost:8090** in a browser. The dashboard refreshes every second.
 
-### With InfluxDB and OpenTelemetry (optional)
+### With InfluxDB — local mode (direct InfluxStore)
 
-1. Start the observability stack (InfluxDB + OTEL Collector):
-
-```bash
-cd observability
-docker compose up -d
-```
-
-2. Run the app with environment variables set (example for a short demo):
+Copy `.env.example` to `.env` and fill in `INFLUXDB_TOKEN`, then:
 
 ```bash
-source venv/bin/activate
-./start.sh
+./start-local.sh
 ```
 
-Or manually:
+This starts InfluxDB + OTEL Collector via Docker Compose, then runs `main.py` with direct InfluxDB access.
+
+### With server API — server mode (ApiStore)
+
+```bash
+./start-server.sh
+```
+
+This builds and starts the full stack (InfluxDB + OTEL + Server API container), then runs `main.py` via ApiStore — the same architecture as a real client-deployed setup.
+
+### LLM Gateway mode (passive observation)
+
+```bash
+./start-gateway.sh
+```
+
+This starts the LLM Gateway reverse proxy on port 4000 (with InfluxDB + OTEL). Point your agents at it:
+
+```bash
+export OPENAI_BASE_URL=http://localhost:4000/v1
+# Now run your LangChain / CrewAI / custom agent normally — no code changes needed.
+python my_agent.py
+```
+
+The gateway auto-discovers agents, learns baselines, and detects anomalies. Use the management API to inspect:
+
+- `GET http://localhost:4000/api/gateway/agents` — discovered agents
+- `GET http://localhost:4000/api/gateway/stats` — detection stats and active anomalies
+- `GET http://localhost:4000/api/gateway/agent/{id}/vitals` — recent vitals for an agent
+
+### Stopping
+
+```bash
+./stop.sh          # stop containers, keep data
+./stop.sh --clean  # stop containers and remove volumes
+```
+
+### Manual run (without scripts)
 
 ```bash
 source venv/bin/activate
 INFLUXDB_URL=http://localhost:8086 \
-INFLUXDB_TOKEN=hackathon-influx-token-1234567890 \
+INFLUXDB_TOKEN=<your-token> \
 INFLUXDB_ORG=appd \
 INFLUXDB_BUCKET=immune_system \
-OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 \
-OTEL_SERVICE_NAME=ai-agent-immune-system \
-OTEL_METRIC_EXPORT_INTERVAL_MS=5000 \
 RUN_DURATION_SECONDS=120 \
-python demo.py
+python main.py
 ```
 
-Use `RUN_DURATION_SECONDS=120` (or similar) for a short demo; `demo.py` defaults to 600s if unset. For a full run use `python main.py` (15 agents, default `RUN_DURATION_SECONDS=1200`). If InfluxDB or OTEL env vars are omitted, the app falls back to in-memory mode and skips metric export. See `docs/DOCS.md` §13 for detailed runbooks and health checks.
+Use `RUN_DURATION_SECONDS=120` (or similar) for a short demo. Default is 1200s. If InfluxDB or OTEL env vars are omitted, the app falls back to in-memory mode and skips metric export. See `docs/DOCS.md` §14 for detailed runbooks and health checks.
 
 ### Environment variables
 
@@ -290,11 +377,16 @@ Use `RUN_DURATION_SECONDS=120` (or similar) for a short demo; `demo.py` defaults
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP HTTP endpoint for metrics export (e.g. `http://localhost:4318`). If set, app exports OTEL metrics. |
 | `OTEL_SERVICE_NAME` | Service name for OTEL resource (default: `ai-agent-immune-system`). |
 | `OTEL_METRIC_EXPORT_INTERVAL_MS` | Metric export interval in ms (default: `5000`). |
-| `RUN_DURATION_SECONDS` | How long the orchestrator runs. Default: `1200` for `main.py`, `600` for `demo.py`. |
+| `RUN_DURATION_SECONDS` | How long the orchestrator runs. Default: `1200`. |
 | `LOG_LEVEL` | Logging level: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` (default: `INFO`). |
 | `LOG_FORMAT` | `text` (colored console) or `json` for log aggregation (default: `text`). |
 | `INGEST_API_KEY` | API key for `POST /api/v1/ingest` and `/api/v1/agents/register`. If not set, auto-generated and cached in `~/.immune_cache/state.json`. |
 | `IMMUNE_CACHE_DIR` | Directory for the local state cache file. Defaults to `~/.immune_cache`. Set to a volume-mounted path in Docker/K8s. |
+| `LLM_UPSTREAM_URL` | LLM Gateway: upstream provider URL (default: `https://api.openai.com`). |
+| `GATEWAY_PORT` | LLM Gateway: listen port (default: `4000`). |
+| `GATEWAY_POLICIES` | LLM Gateway: JSON array of policy rules for rate limits, model access controls. |
+| `MCP_UPSTREAM_URL` | MCP Proxy: upstream MCP server URL (default: `http://localhost:3000`). |
+| `MCP_PROXY_PORT` | MCP Proxy: listen port (default: `4001`). |
 
 ---
 
@@ -342,16 +434,16 @@ Sections are collapsible. All data is read from the orchestrator and refreshed e
 
 - Python 3.8+
 - Dependencies (see `requirements.txt`): `flask`, `flask-cors` (dashboard); `requests` (for ApiStore and immune_sdk); `influxdb-client` (optional, for direct InfluxDB persistence); `opentelemetry-api`, `opentelemetry-sdk`, `opentelemetry-exporter-otlp` (optional, for metrics export).
-- Optional: Docker and Docker Compose to run the observability stack in `observability/`.
+- Optional: Docker and Docker Compose to run the infrastructure stack (`docker-compose.yml`).
 
 ---
 
 ## Further documentation
 
-- **`docs/DOCS.md`** — **Single reference** for everything: executive summary, architecture (client-deployed), integration diagrams (Mermaid), internal design (HLD/LLD/Sequence), healing & deviation (§4), server REST API (§6), client config (§5), InfluxDB schema, alternative deployment, migration, security/SLOs, runtime notes, **operations runbook** (§13), **doc/code/test sync** (§15). Update this doc when anything changes.
-- **`docs/PRODUCTION_READINESS.md`** — Production readiness analysis: architect and observability review, gaps (security, resilience, observability, packaging), and prioritized recommendations.
+- **`docs/DOCS.md`** — **Single reference** for everything: executive summary, architecture (client-deployed), integration diagrams (Mermaid), internal design (HLD/LLD/Sequence), healing & deviation (§4), server REST API (§6), client config (§5), InfluxDB schema, LLM Gateway (§8), alternative deployment, migration, security/SLOs, runtime notes, **operations runbook** (§14), **doc/code/test sync** (§16). Update this doc when anything changes.
+- **`docs/GATEWAY_ARCHITECTURE_DECISION.md`** — Architecture decision record for the LLM Gateway approach: problem statement, five options evaluated (SDK, gateway, MCP, OTEL, network-level), pros/cons, diagrams, tradeoffs, and rationale for the chosen layered approach.
 - **`tests/README.md`** — Test coverage vs DOCS scenarios; which tests cover ApiStore, dashboard, store-backed detection, run_id isolation, immune memory, and Heal now.
-- **`presentation.py`** — Optional: generates a PowerPoint deck (requires `python-pptx`); not part of the runtime.
+- **`server/`** — Server API implementation (`app.py`) and quick-start README. See `server/README.md`.
 
 ---
 

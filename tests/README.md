@@ -14,6 +14,12 @@ This document maps **DOCS.md** real-world behavior to test coverage and lists **
 | **Healing policies** | `test_healing.py` | Policy ladder, next_action (skip failed), all diagnosis types have policies ending in RESET_AGENT |
 | **Orchestrator (integration)** | `test_orchestrator.py` | Baseline learning, latency spike → infection, quarantine → cache persist/restore, **HITL**: severe → pending, approve, reject; **auto-heal**; deviation threshold |
 | **SDK** | `test_sdk.py` | Payload construction, API key header, buffering, error callback; mocks HTTP to ingest |
+| **Gateway: Vitals** | `test_gateway_vitals.py` | System prompt extraction, tool-call counting, cost estimation, full vitals from request/response, streaming chunk extraction |
+| **Gateway: Fingerprint** | `test_gateway_fingerprint.py` | X-Agent-ID header, API key hash, IP+UA fallback, priority order, agent type derivation from User-Agent |
+| **Gateway: Discovery** | `test_gateway_discovery.py` | New agent creation, count increment, model/IP accumulation, type upgrade, callback on new agent, list/count |
+| **Gateway: Policy** | `test_gateway_policy.py` | Empty rules allow all, model block/allow lists, rate limiting, glob pattern matching, rule serialization |
+| **Gateway: App** | `test_gateway_app.py` | Health endpoint, agents/stats/policies/vitals/baseline APIs, proxy passthrough, Cache-Control headers |
+| **Gateway: OTEL** | `test_gateway_otel.py` | LLM span detection heuristics, span-to-vitals extraction, error status, agent_id from attributes, ImmuneSpanProcessor on_end/on_start |
 
 ## Gaps for Real-World Scenarios (and coverage added)
 
@@ -61,10 +67,21 @@ This document maps **DOCS.md** real-world behavior to test coverage and lists **
 - **DOCS §2.4, §3.3:** Full loop with persistent store and infection/healing events in store.
 - **Gap:** Not yet a single E2E test with store asserting infection_event and healing_event written. Store-backed detection and orchestrator-with-store tests cover the main data path.
 
+### 10. **LLM Gateway (passive observation)** — ✅ Covered
+
+- **DOCS §8:** Gateway reverse proxy, fingerprinting, discovery, policy engine, management APIs.
+- **Coverage:**
+  - `tests/test_gateway_vitals.py` — System prompt extraction, tool-call counting, cost estimation, full vitals from request/response, streaming chunk extraction.
+  - `tests/test_gateway_fingerprint.py` — X-Agent-ID header, API key hash, IP+UA fallback, priority order, agent type derivation.
+  - `tests/test_gateway_discovery.py` — New agent creation, count increment, model/IP accumulation, type upgrade, callback on new, list/count.
+  - `tests/test_gateway_policy.py` — Empty rules allow all, model block/allow lists, rate limiting, glob patterns, rule serialization.
+  - `tests/test_gateway_app.py` — Health, agents, stats, policies, vitals, baseline management APIs; proxy passthrough; Cache-Control headers.
+  - `tests/test_gateway_otel.py` — LLM span detection, span-to-vitals extraction, error status, agent_id from attributes, ImmuneSpanProcessor.
+
 ## Summary
 
-- **Unit/component tests** for detection, baseline, cache, telemetry, diagnosis, healing policies, and orchestrator (with in-memory store) are in good shape for the scenarios described in DOCS.
-- **Covered (items 1–7 above):** ApiStore contract, dashboard HTTP (ingest, approve, heal-now, read APIs), store-backed detection, run_id isolation, restart resilience (no cache), ImmuneMemory + Healer execution, rejected → Heal now flow.
-- **Optional / not yet covered:** ChaosInjector tests; single E2E test with persistent store asserting infection_event and healing_event written.
+- **Unit/component tests** for detection, baseline, cache, telemetry, diagnosis, healing policies, orchestrator, gateway, and SDK are in good shape for the scenarios described in DOCS.
+- **Covered (items 1–10 above):** ApiStore contract, dashboard HTTP (ingest, approve, heal-now, read APIs), store-backed detection, run_id isolation, restart resilience (no cache), ImmuneMemory + Healer execution, rejected → Heal now flow, LLM Gateway (vitals extraction, fingerprinting, discovery, policy engine, management API, OTEL processor).
+- **Optional / not yet covered:** ChaosInjector tests; single E2E test with persistent store asserting infection_event and healing_event written; MCP proxy integration tests (requires live MCP server).
 
-**Test files:** `test_api_store.py`, `test_web_dashboard.py`, `test_store_backed.py`, `test_memory.py`, `store_helpers.py` (InMemoryStore), plus existing `test_*.py` for detection, baseline, cache, telemetry, diagnosis, healing, orchestrator, sdk.
+**Test files:** `test_api_store.py`, `test_web_dashboard.py`, `test_store_backed.py`, `test_memory.py`, `store_helpers.py` (InMemoryStore), `test_gateway_vitals.py`, `test_gateway_fingerprint.py`, `test_gateway_discovery.py`, `test_gateway_policy.py`, `test_gateway_app.py`, `test_gateway_otel.py`, plus existing `test_*.py` for detection, baseline, cache, telemetry, diagnosis, healing, orchestrator, sdk.
