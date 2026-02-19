@@ -29,6 +29,12 @@ class TestHealthEndpoint:
         assert "upstream" in data
         assert "agents_discovered" in data
 
+    def test_health_includes_providers(self, client):
+        r = client.get("/health")
+        data = r.get_json()
+        assert "providers" in data
+        assert "default" in data["providers"]
+
 
 class TestGatewayAgentsAPI:
     def test_agents_initially_empty(self, client):
@@ -102,3 +108,150 @@ class TestCacheControlHeader:
                 content_type="application/json",
             )
             assert r.headers.get("Cache-Control") == "no-store"
+
+
+# ── Provider management API ──────────────────────────────────────────────
+
+
+class TestProviderManagementAPI:
+    def test_list_providers_default_only(self, client):
+        r = client.get("/api/gateway/providers")
+        assert r.status_code == 200
+        data = r.get_json()
+        assert "default" in data
+
+    def test_register_provider(self, client):
+        r = client.post(
+            "/api/gateway/providers",
+            data=json.dumps({"name": "azure", "url": "https://myresource.openai.azure.com"}),
+            content_type="application/json",
+        )
+        assert r.status_code == 201
+        data = r.get_json()
+        assert data["registered"] is True
+        assert data["name"] == "azure"
+
+        r2 = client.get("/api/gateway/providers")
+        assert "azure" in r2.get_json()
+
+    def test_register_provider_missing_fields(self, client):
+        r = client.post(
+            "/api/gateway/providers",
+            data=json.dumps({"name": ""}),
+            content_type="application/json",
+        )
+        assert r.status_code == 400
+
+    def test_register_provider_invalid_url(self, client):
+        r = client.post(
+            "/api/gateway/providers",
+            data=json.dumps({"name": "bad", "url": "ftp://example.com"}),
+            content_type="application/json",
+        )
+        assert r.status_code == 400
+
+    def test_unregister_provider(self, client):
+        client.post(
+            "/api/gateway/providers",
+            data=json.dumps({"name": "temp", "url": "https://temp.example.com"}),
+            content_type="application/json",
+        )
+        r = client.delete("/api/gateway/providers/temp")
+        assert r.status_code == 200
+        data = r.get_json()
+        assert data["unregistered"] is True
+
+    def test_cannot_unregister_default(self, client):
+        r = client.delete("/api/gateway/providers/default")
+        assert r.status_code == 400
+
+    def test_unregister_nonexistent(self, client):
+        r = client.delete("/api/gateway/providers/ghost")
+        assert r.status_code == 400
+
+
+# ── Route management API ─────────────────────────────────────────────────
+
+
+class TestRouteManagementAPI:
+    def test_list_routes_initially_empty(self, client):
+        r = client.get("/api/gateway/routes")
+        assert r.status_code == 200
+        assert r.get_json() == {}
+
+    def test_set_route(self, client):
+        client.post(
+            "/api/gateway/providers",
+            data=json.dumps({"name": "azure", "url": "https://azure.openai.com"}),
+            content_type="application/json",
+        )
+        r = client.post(
+            "/api/gateway/routes",
+            data=json.dumps({"agent_id": "agent-1", "provider": "azure"}),
+            content_type="application/json",
+        )
+        assert r.status_code == 201
+        data = r.get_json()
+        assert data["routed"] is True
+
+        r2 = client.get("/api/gateway/routes")
+        assert r2.get_json() == {"agent-1": "azure"}
+
+    def test_set_route_unknown_provider(self, client):
+        r = client.post(
+            "/api/gateway/routes",
+            data=json.dumps({"agent_id": "agent-1", "provider": "nonexistent"}),
+            content_type="application/json",
+        )
+        assert r.status_code == 400
+
+    def test_set_route_missing_fields(self, client):
+        r = client.post(
+            "/api/gateway/routes",
+            data=json.dumps({"agent_id": ""}),
+            content_type="application/json",
+        )
+        assert r.status_code == 400
+
+    def test_remove_route(self, client):
+        client.post(
+            "/api/gateway/providers",
+            data=json.dumps({"name": "azure", "url": "https://azure.openai.com"}),
+            content_type="application/json",
+        )
+        client.post(
+            "/api/gateway/routes",
+            data=json.dumps({"agent_id": "agent-1", "provider": "azure"}),
+            content_type="application/json",
+        )
+        r = client.delete("/api/gateway/routes/agent-1")
+        assert r.status_code == 200
+        assert r.get_json()["removed"] is True
+
+    def test_remove_nonexistent_route(self, client):
+        r = client.delete("/api/gateway/routes/ghost")
+        assert r.status_code == 404
+
+
+# ── Header stripping ─────────────────────────────────────────────────────
+
+
+class TestXLLMProviderHeaderStripping:
+    def test_header_stripped_before_upstream(self):
+        from gateway.proxy import LLMProxy
+        incoming = {
+            "Authorization": "Bearer sk-test",
+            "X-LLM-Provider": "azure",
+            "Content-Type": "application/json",
+        }
+        forwarded = LLMProxy._forward_headers(incoming)
+        assert "X-LLM-Provider" not in forwarded
+        assert "Authorization" in forwarded
+        assert "Content-Type" in forwarded
+
+    def test_header_stripped_case_insensitive(self):
+        from gateway.proxy import LLMProxy
+        incoming = {"x-llm-provider": "azure", "Accept": "*/*"}
+        forwarded = LLMProxy._forward_headers(incoming)
+        assert "x-llm-provider" not in forwarded
+        assert "Accept" in forwarded

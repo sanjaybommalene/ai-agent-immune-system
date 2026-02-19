@@ -22,6 +22,7 @@ from immune_system.logging_config import get_logger
 from .discovery import DiscoveryService
 from .fingerprint import AgentFingerprinter
 from .policy import PolicyAction, PolicyDecision, PolicyEngine
+from .routing import RoutingTable
 from .vitals_extractor import extract_vitals, extract_vitals_from_stream_chunks
 
 logger = get_logger("proxy")
@@ -39,34 +40,47 @@ class LLMProxy:
 
     def __init__(
         self,
-        upstream_base_url: str,
+        routing: RoutingTable,
         fingerprinter: AgentFingerprinter,
         discovery: DiscoveryService,
         policy: PolicyEngine,
         on_vitals: Optional[Callable[[Dict[str, Any]], None]] = None,
         timeout: float = _UPSTREAM_TIMEOUT,
+        quarantine_controller=None,
     ):
-        self.upstream = upstream_base_url.rstrip("/")
+        self.routing = routing
         self.fingerprinter = fingerprinter
         self.discovery = discovery
         self.policy = policy
         self.on_vitals = on_vitals
+        self.quarantine = quarantine_controller
         self._client = httpx.Client(timeout=timeout, follow_redirects=True)
+
+    @property
+    def upstream(self) -> str:
+        """Default upstream URL (backward-compat for /health endpoint)."""
+        return self.routing.registry.default
 
     def close(self):
         self._client.close()
 
-    def _upstream_url(self, path: str) -> str:
-        return f"{self.upstream}{path}"
+    def _resolve_upstream(self, agent_id: str, headers: dict, path: str) -> str:
+        """Build the full upstream URL using the three-tier routing chain."""
+        provider_hint = (headers.get("X-LLM-Provider") or headers.get("x-llm-provider") or "").strip()
+        base = self.routing.resolve(agent_id, provider_hint)
+        return f"{base}{path}"
 
     @staticmethod
     def _forward_headers(incoming: dict) -> dict:
-        """Build headers for the upstream request, stripping hop-by-hop."""
+        """Build headers for the upstream request, stripping hop-by-hop
+        and the gateway-internal ``X-LLM-Provider`` header."""
         out = {}
         for k, v in incoming.items():
             if k.lower() in _HOP_BY_HOP:
                 continue
             if k.lower() == "host":
+                continue
+            if k.lower() == "x-llm-provider":
                 continue
             out[k] = v
         return out
@@ -88,6 +102,11 @@ class LLMProxy:
         agent_id = self.fingerprinter.identify(headers=headers, remote_addr=remote_addr)
         agent_type = self.fingerprinter.derive_agent_type(agent_id, headers)
 
+        if self.quarantine and self.quarantine.is_quarantined(agent_id):
+            err = {"error": {"message": "Agent is quarantined by immune system", "type": "quarantined"}}
+            logger.warning("QUARANTINE BLOCK: agent=%s", agent_id)
+            return 503, {"Content-Type": "application/json"}, json.dumps(err).encode()
+
         request_body = self._parse_body(body)
         model = request_body.get("model", "") if request_body else ""
 
@@ -101,7 +120,7 @@ class LLMProxy:
             return status, {"Content-Type": "application/json"}, json.dumps(err).encode()
 
         fwd_headers = self._forward_headers(headers)
-        url = self._upstream_url(path)
+        url = self._resolve_upstream(agent_id, headers, path)
 
         t0 = time.time()
         try:
@@ -168,6 +187,14 @@ class LLMProxy:
         agent_id = self.fingerprinter.identify(headers=headers, remote_addr=remote_addr)
         agent_type = self.fingerprinter.derive_agent_type(agent_id, headers)
 
+        if self.quarantine and self.quarantine.is_quarantined(agent_id):
+            err = {"error": {"message": "Agent is quarantined by immune system", "type": "quarantined"}}
+            logger.warning("QUARANTINE BLOCK (stream): agent=%s", agent_id)
+
+            def _q_gen():
+                yield json.dumps(err).encode()
+            return 503, {"Content-Type": "application/json"}, _q_gen()
+
         request_body = self._parse_body(body) or {}
         model = request_body.get("model", "")
 
@@ -187,7 +214,7 @@ class LLMProxy:
             return status, {"Content-Type": "application/json"}, _err_gen()
 
         fwd_headers = self._forward_headers(headers)
-        url = self._upstream_url(path)
+        url = self._resolve_upstream(agent_id, headers, path)
         t0 = time.time()
 
         try:

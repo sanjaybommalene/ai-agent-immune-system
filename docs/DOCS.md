@@ -85,11 +85,11 @@ flowchart TB
 | **TelemetryCollector** | Records vitals via `store.write_agent_vitals()`; reads recent vitals via `store.get_recent_agent_vitals()`, etc. |
 | **BaselineLearner** | EWMA adaptive baselines per metric per agent. Continuously updates on each vitals sample. State cached locally (CacheManager) and periodically persisted to store. |
 | **Sentinel** | **Deviation calculated here.** Compares recent vitals to EWMA baseline in `detect_infection(recent, baseline)`; emits InfectionReport (max_deviation, anomalies). Uses a stddev floor (5% of mean) when stddev is 0 — this prevents metrics that were constant during learning from being invisible to detection. |
-| **Diagnostician** | Maps anomaly patterns to diagnosis types (prompt_drift, prompt_injection, infinite_loop, tool_instability, cost_overrun, etc.). |
-| **Healer** | Applies policy ladder + immune memory; records outcomes via store; triggers quarantine release. Actions: reset_memory, rollback_prompt, reduce_autonomy, revoke_tools, reset_agent. |
-| **QuarantineController** | In-memory set of quarantined agent IDs; persisted to CacheManager for restart resilience; approval workflow state (pending/rejected) read/written via store. |
-| **ImmuneMemory** | Failed actions and pattern summary via store. |
-| **Web Dashboard** | Serves UI; reads state from orchestrator (which reads from store); POST approve/reject/heal-now. |
+| **Diagnostician** | Multi-hypothesis root-cause analysis: maps anomaly patterns to ranked diagnosis types (prompt_drift, prompt_injection, infinite_loop, tool_instability, cost_overrun, external_cause, unknown) with confidence scores.  Supports operator feedback to adjust accuracy over time. |
+| **Healer** | Applies policy ladder + immune memory; uses pluggable executors (simulated, gateway, process, container); success-weighted action selection reorders the policy based on global success patterns; probation-based post-healing validation with fresh vitals. Actions: reset_memory, rollback_prompt, reduce_autonomy, revoke_tools, reset_agent. |
+| **QuarantineController** | Tracks quarantined agent IDs with pluggable enforcement strategies; supports async quarantine/release/drain; persisted to CacheManager for restart resilience; approval workflow state (pending/rejected) read/written via store. |
+| **ImmuneMemory** | Records per-agent per-diagnosis healing outcomes; tracks global success/failure patterns for cross-agent generalization; stores operator feedback; pattern summary via store. |
+| **Web Dashboard** | Serves UI; reads state from orchestrator (which reads from store); POST approve/reject/heal-now; POST /api/feedback for operator diagnosis corrections. |
 | **CacheManager** | Local JSON file cache (`~/.immune_cache/state.json`). Persists run_id, EWMA baselines, quarantine set, and API key across restarts. Atomic writes (temp + rename). Periodic flush (30s). File permissions restricted to owner (0600). |
 | **Store** | **ApiStore** when `SERVER_API_BASE_URL` is set: same interface as `InfluxStore`, but every call is HTTP to the server REST API. No direct InfluxDB. |
 
@@ -126,6 +126,10 @@ Entry point: `main.py` with `SERVER_API_BASE_URL` (and optional `SERVER_API_KEY`
 | Dashboard | `immune_system/web_dashboard.py` | Flask REST + UI; approve/reject/heal-now. |
 | Store (direct DB) | `immune_system/influx_store.py` | InfluxStore when using InfluxDB directly. |
 | Store (API) | `immune_system/api_store.py` | ApiStore when using server REST API. |
+| Lifecycle | `immune_system/lifecycle.py` | 8-state agent lifecycle state machine (INITIALIZING through EXHAUSTED). |
+| Enforcement | `immune_system/enforcement.py` | Pluggable enforcement: GatewayEnforcement, ProcessEnforcement, ContainerEnforcement, CompositeEnforcement. |
+| Executor | `immune_system/executor.py` | Pluggable healing executors: SimulatedExecutor, GatewayExecutor, ProcessExecutor, ContainerExecutor. |
+| Correlator | `immune_system/correlator.py` | Fleet-wide anomaly correlation to distinguish agent-specific vs. systemic issues. |
 | Chaos | `immune_system/chaos.py` | ChaosInjector; optional demo infection injection. |
 | Python SDK | `immune_sdk.py` | Lightweight reporter for external Python agents (wraps HTTP ingest). |
 | Start scripts | `start-local.sh`, `start-server.sh`, `start-gateway.sh`, `stop.sh` | Start infrastructure and client in local, server, or gateway mode; stop tears down containers. |
@@ -336,14 +340,19 @@ sequenceDiagram
 - `immune_system/telemetry.py` — Telemetry abstraction and OTel metric instruments.
 - `immune_system/baseline.py` — Baseline profile learning and retrieval.
 - `immune_system/detection.py` — Statistical anomaly detection and deviation scoring (deviation calculated here).
-- `immune_system/diagnosis.py` — Rule-based diagnosis from anomaly patterns.
-- `immune_system/healing.py` — Healing policies and action execution/validation.
-- `immune_system/memory.py` — Immune memory (failed actions/pattern summaries), backed by store queries.
+- `immune_system/diagnosis.py` — Multi-hypothesis diagnosis from anomaly patterns; ranked hypotheses with confidence scores; operator feedback adjustment.
+- `immune_system/healing.py` — Healing policies, pluggable executor-based action execution, success-weighted selection, probation-based validation.
+- `immune_system/memory.py` — Immune memory (failed actions, global success/failure patterns, operator feedback), backed by store queries.
 - `immune_system/web_dashboard.py` — REST API + UI rendering; user actions for approval/rejection/heal-now.
 - `immune_system/influx_store.py` — InfluxDB persistence/query layer (used when `INFLUXDB_*` is set).
 - `immune_system/api_store.py` — Server API–backed store (used when `SERVER_API_BASE_URL` is set). See §6 for API contract.
 - `immune_system/logging_config.py` — Logging setup (JSON or colored console).
-- `immune_system/quarantine.py`, `immune_system/chaos.py` — Quarantine controller and chaos injector.
+- `immune_system/quarantine.py` — Quarantine controller with pluggable enforcement.
+- `immune_system/lifecycle.py` — 8-state agent lifecycle state machine.
+- `immune_system/enforcement.py` — Pluggable enforcement strategies (gateway, process, container, composite).
+- `immune_system/executor.py` — Pluggable healing executors (simulated, gateway, process, container).
+- `immune_system/correlator.py` — Fleet-wide anomaly correlation.
+- `immune_system/chaos.py` — ChaosInjector; demo infection injection.
 - `immune_sdk.py` — Lightweight Python SDK for external agents (wraps `POST /api/v1/ingest`).
 - `server/app.py` — Server API: REST bridge between ApiStore and InfluxDB (implements §6).
 - `gateway/app.py` — LLM Gateway: Flask app serving the reverse proxy and management API (§8).
@@ -352,6 +361,7 @@ sequenceDiagram
 - `gateway/fingerprint.py` — Derives agent IDs from API keys, IPs, headers.
 - `gateway/discovery.py` — Auto-discovery registry for agents.
 - `gateway/policy.py` — Policy engine: rate limits, model access, token budgets.
+- `gateway/routing.py` — Multi-provider routing: ProviderRegistry (allowlisted upstreams) and RoutingTable (per-agent upstream assignment with three-tier resolution: header → per-agent → default).
 - `gateway/mcp_proxy.py` — Optional MCP tool-call observation proxy.
 - `gateway/otel_processor.py` — Optional OTEL SpanProcessor for `gen_ai.*` spans.
 - `start-local.sh`, `start-server.sh`, `start-gateway.sh`, `stop.sh` — Start/stop scripts for local, server, and gateway modes.
@@ -392,7 +402,7 @@ Orchestrator feeds each vitals sample into the EWMA baseline learner and calls `
 - **reduce_autonomy** → `agent.state.reduce_autonomy()`  
 - **revoke_tools** → `agent.state.revoke_tools()` (disables tool access; used for prompt injection and infinite loop)  
 - **reset_agent** → resets all agent state to defaults.  
-Status: `HEALTHY`, `INFECTED`, `QUARANTINED`; after successful healing, release from quarantine.
+Status lifecycle: `INITIALIZING` → `HEALTHY` → `SUSPECTED` → `DRAINING` → `QUARANTINED` → `HEALING` → `PROBATION` → `HEALTHY` (or `EXHAUSTED`).  See `docs/AGENT_LIFECYCLE.md` for the full 8-state machine, transition guards, enforcement strategies, healing executors, multi-hypothesis diagnosis, and 10 detailed use cases.
 
 ### 4.4 EWMA adaptive baselines
 
@@ -430,6 +440,28 @@ File is atomic-written (temp + rename) to prevent corruption. Permissions restri
 The ingest and registration endpoints (`POST /api/v1/ingest`, `POST /api/v1/agents/register`) require an `X-API-KEY` header. Priority order: env var `INGEST_API_KEY` → cached value → auto-generated on first run and persisted in cache. Only the key prefix is logged on startup (not the full key).
 
 Dashboard UI endpoints (read-only) do not require authentication.
+
+### 4.7 Production enforcement and lifecycle
+
+The immune system now supports **real-world enforcement** via pluggable strategies:
+
+- **GatewayEnforcement** — injects blocking policy rules into the LLM Gateway proxy.  Works for any agent routing traffic through the gateway.
+- **ProcessEnforcement** — sends OS signals (`SIGSTOP`/`SIGCONT`) to managed agent processes.  Requires same-user or root.
+- **ContainerEnforcement** — `docker pause`/`unpause` or `kubectl scale` for containerized agents.
+- **CompositeEnforcement** — chains multiple strategies in priority order (gateway → process → container).
+
+Healing actions are executed via pluggable **HealingExecutors**:
+
+- **SimulatedExecutor** — modifies in-memory agent state (demo mode).
+- **GatewayExecutor** — applies healing through gateway policy changes (rate limits, model blocks).
+- **ProcessExecutor** — calls the agent's HTTP control API (`/control/reset-memory`, etc.).
+- **ContainerExecutor** — uses `docker restart` or `kubectl rollout restart`.
+
+The **multi-hypothesis diagnostician** returns ranked diagnoses.  If the primary hypothesis fails, the orchestrator falls back to secondary hypotheses.  **Fleet-wide correlation** prevents misdiagnosing provider outages as individual agent failures.  **Operator feedback** (`POST /api/feedback`) refines diagnosis accuracy over time.
+
+After successful healing, **baseline adaptation** accelerates EWMA convergence so the agent's new normal is learned quickly.
+
+For the full specification, see `docs/AGENT_LIFECYCLE.md`.
 
 ---
 
@@ -549,6 +581,7 @@ flowchart LR
     subgraph gw ["LLM Gateway (:4000)"]
         FP["Fingerprinter"]
         POL["Policy Engine"]
+        RT["Router"]
         PROXY["Reverse Proxy"]
         EXT["Vitals Extractor"]
         DISC["Discovery Service"]
@@ -557,6 +590,7 @@ flowchart LR
     subgraph upstream ["LLM Providers"]
         OAI["OpenAI"]
         AZ["Azure OpenAI"]
+        VLLM["vLLM / Other"]
     end
 
     subgraph core ["Immune System Core"]
@@ -569,9 +603,11 @@ flowchart LR
     A2 --> FP
     A3 --> FP
     FP --> POL
-    POL --> PROXY
+    POL --> RT
+    RT --> PROXY
     PROXY --> OAI
     PROXY --> AZ
+    PROXY --> VLLM
     PROXY --> EXT
     FP --> DISC
     EXT --> TEL
@@ -593,6 +629,7 @@ flowchart LR
 | Agent Fingerprinter | `gateway/fingerprint.py` | Derives stable `agent_id` from `X-Agent-ID` header, API key hash, or IP+User-Agent hash. |
 | Discovery Service | `gateway/discovery.py` | Auto-detects and tracks agents; records first-seen, last-seen, request count, models used, source IPs. |
 | Policy Engine | `gateway/policy.py` | Pre-request evaluation: rate limits (requests/min, tokens/min), model allow/block lists, per-agent budgets. Actions: ALLOW, BLOCK (403), THROTTLE (429), ALERT. |
+| Routing | `gateway/routing.py` | Multi-provider routing: ProviderRegistry (allowlisted upstreams) and RoutingTable (per-agent upstream assignment). Three-tier resolution: header → per-agent → default. |
 | Gateway App | `gateway/app.py` | Flask app that mounts the proxy at `/v1/*` and exposes management APIs. |
 | MCP Proxy | `gateway/mcp_proxy.py` | Optional: HTTP/SSE middleware that observes MCP `tools/call` requests between agents and MCP servers. |
 | OTEL Processor | `gateway/otel_processor.py` | Optional: OTEL `SpanProcessor` that converts `gen_ai.*` spans (from LangChain, LlamaIndex, OpenLLMetry) into vitals. |
@@ -655,17 +692,84 @@ Policies are loaded from the `GATEWAY_POLICIES` environment variable (JSON array
 | `/api/gateway/policies` | GET | Active policy rules |
 | `/api/gateway/agent/{id}/vitals` | GET | Recent vitals for a specific agent |
 | `/api/gateway/agent/{id}/baseline` | GET | Baseline profile for a specific agent |
+| `/api/gateway/quarantine` | GET | List all quarantined agents |
+| `/api/gateway/quarantine/{id}` | POST | Quarantine a specific agent (body: `{"reason": "..."}`) |
+| `/api/gateway/quarantine/{id}` | DELETE | Release a quarantined agent |
+| `/api/gateway/lifecycle/{id}` | GET | Agent lifecycle phase, history, and execution status |
+| `/api/gateway/providers` | GET | List all registered LLM providers (name → URL) |
+| `/api/gateway/providers` | POST | Register a provider: `{"name":"azure","url":"https://..."}` |
+| `/api/gateway/providers/{name}` | DELETE | Remove a registered provider (cannot remove "default") |
+| `/api/gateway/routes` | GET | List per-agent routing table (agent_id → provider name) |
+| `/api/gateway/routes` | POST | Set agent route: `{"agent_id":"...","provider":"azure"}` |
+| `/api/gateway/routes/{agent_id}` | DELETE | Remove per-agent route (falls back to default) |
 
-### 8.8 Deployment
+### 8.8 Multi-Provider Routing
+
+The gateway supports routing different agents to different LLM providers (OpenAI, Azure OpenAI, vLLM, etc.) using a three-tier resolution chain:
+
+1. **`X-LLM-Provider` header** — agent sets this header to a registered provider name or URL.
+2. **Per-agent routing table** — admin-configured via the management API.
+3. **Default upstream** — `LLM_UPSTREAM_URL` environment variable.
+
+Only providers registered in the **ProviderRegistry** allowlist are accepted (SSRF protection). Unknown names or URLs silently fall through to the next tier.
+
+```mermaid
+%%{init: {'theme': 'base', 'themeVariables': {'primaryColor': '#e8eaf6', 'primaryTextColor': '#1a1a1a', 'primaryBorderColor': '#3949ab', 'lineColor': '#37474f', 'secondaryColor': '#f3e5f5', 'tertiaryColor': '#e8f5e9', 'edgeLabelBackground': '#ffffff'}}}%%
+flowchart TD
+    REQ["Incoming Request"] --> FP["Fingerprinter<br/>extracts agent_id"]
+    FP --> H{"X-LLM-Provider<br/>header set?"}
+    H -->|"yes"| HL{"In allowlist?"}
+    HL -->|"yes"| UseH["Route to header provider"]
+    HL -->|"no"| T
+    H -->|"no"| T{"Per-agent route<br/>configured?"}
+    T -->|"yes"| UseT["Route to per-agent provider"]
+    T -->|"no"| UseD["Route to default upstream"]
+    UseH --> PROXY["Forward to upstream"]
+    UseT --> PROXY
+    UseD --> PROXY
+    PROXY --> UP_OAI["OpenAI"]
+    PROXY --> UP_AZ["Azure OpenAI"]
+    PROXY --> UP_VLLM["vLLM / Other"]
+```
+
+**Environment config:**
+
+```bash
+# Default upstream (always registered as "default")
+export LLM_UPSTREAM_URL=https://api.openai.com
+
+# Additional named providers (JSON object)
+export GATEWAY_PROVIDERS='{"azure":"https://myresource.openai.azure.com","vllm":"http://localhost:8000"}'
+```
+
+**Runtime management:**
+
+```bash
+# Register a provider
+curl -X POST http://localhost:4000/api/gateway/providers \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"azure","url":"https://myresource.openai.azure.com"}'
+
+# Route an agent to a provider
+curl -X POST http://localhost:4000/api/gateway/routes \
+  -H 'Content-Type: application/json' \
+  -d '{"agent_id":"key-a1b2c3d4e5f6","provider":"azure"}'
+```
+
+The `X-LLM-Provider` header is stripped before forwarding to the upstream provider.
+
+### 8.9 Deployment
 
 **Docker Compose** (recommended):
 ```bash
 ./start-gateway.sh
 ```
 
-**Manual**:
+**Manual** (runs gateway locally using latest code, useful for development):
 ```bash
-LLM_UPSTREAM_URL=https://api.openai.com python -m gateway
+LLM_UPSTREAM_URL=https://api.openai.com \
+GATEWAY_PROVIDERS='{"azure":"https://myresource.openai.azure.com"}' \
+python -m gateway
 ```
 
 Then point agents:
@@ -673,7 +777,7 @@ Then point agents:
 export OPENAI_BASE_URL=http://localhost:4000/v1
 ```
 
-### 8.9 MCP Proxy (Optional)
+### 8.10 MCP Proxy (Optional)
 
 The MCP proxy (`gateway/mcp_proxy.py`) intercepts MCP `tools/call` JSON-RPC requests to observe tool usage. Start separately:
 
@@ -683,7 +787,7 @@ MCP_UPSTREAM_URL=http://localhost:3000 python -m gateway.mcp_proxy
 
 Management endpoints: `GET /mcp-proxy/health`, `GET /mcp-proxy/tool-calls`, `GET /mcp-proxy/stats`.
 
-### 8.10 OTEL Span Processor (Optional)
+### 8.11 OTEL Span Processor (Optional)
 
 For agent frameworks that already emit OTEL traces (`gen_ai.*` semantic conventions), add the `ImmuneSpanProcessor` to the trace pipeline:
 
@@ -963,7 +1067,7 @@ When system behavior looks wrong, run this checklist in order:
 
 Syntax check core files:
 ```bash
-python3 -m py_compile main.py immune_system/orchestrator.py immune_system/telemetry.py immune_system/baseline.py immune_system/detection.py immune_system/healing.py immune_system/memory.py immune_system/quarantine.py immune_system/chaos.py immune_system/web_dashboard.py immune_system/influx_store.py immune_system/api_store.py immune_system/cache.py server/app.py
+python3 -m py_compile main.py immune_system/orchestrator.py immune_system/telemetry.py immune_system/baseline.py immune_system/detection.py immune_system/healing.py immune_system/memory.py immune_system/quarantine.py immune_system/lifecycle.py immune_system/enforcement.py immune_system/executor.py immune_system/correlator.py immune_system/chaos.py immune_system/web_dashboard.py immune_system/influx_store.py immune_system/api_store.py immune_system/cache.py server/app.py gateway/routing.py
 ```
 
 Find process on dashboard port:
@@ -994,6 +1098,7 @@ Keep this document, the codebase, and the test suite aligned with the **project 
 | **Server API contract** | §6: paths and payloads must match `api_store.py` and any server implementation. |
 | **Gateway** | §8: gateway components match files under `gateway/`; management API endpoints match `gateway/app.py` routes. |
 | **Diagrams** | §2.1, §2.6, §3.1–3.3, §8.2, §10: Mermaid reflects client-deployed flow, store, gateway, and optional server-side. |
+| **Lifecycle & enforcement** | `docs/AGENT_LIFECYCLE.md`: states, enforcement strategies, executors, multi-hypothesis, use cases; must match `lifecycle.py`, `enforcement.py`, `executor.py`, `correlator.py`. |
 | **Tests** | `tests/README.md` maps DOCS scenarios to test files; run `pytest tests/` (use venv: `./venv/bin/python -m pytest tests/`). |
 
 When changing behavior or adding components, update DOCS first, then code, then add or adjust tests and `tests/README.md`.

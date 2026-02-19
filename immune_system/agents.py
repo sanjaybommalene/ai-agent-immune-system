@@ -21,9 +21,15 @@ MODEL_COST_PER_1K = {
 
 
 class AgentStatus(Enum):
+    INITIALIZING = "initializing"
     HEALTHY = "healthy"
-    INFECTED = "infected"
+    SUSPECTED = "suspected"
+    DRAINING = "draining"
     QUARANTINED = "quarantined"
+    HEALING = "healing"
+    PROBATION = "probation"
+    EXHAUSTED = "exhausted"
+    INFECTED = "infected"
 
 
 @dataclass
@@ -203,7 +209,11 @@ class BaseAgent:
     def quarantine(self):
         """Quarantine the agent"""
         self.status = AgentStatus.QUARANTINED
-    
+
+    def set_phase(self, phase: AgentStatus):
+        """Set the agent's lifecycle phase directly."""
+        self.status = phase
+
     def release(self):
         """Release from quarantine"""
         self.status = AgentStatus.HEALTHY if not self.infected else AgentStatus.INFECTED

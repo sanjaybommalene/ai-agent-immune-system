@@ -11,7 +11,14 @@ This document maps **DOCS.md** real-world behavior to test coverage and lists **
 | **Cache** | `test_cache.py` | Load/save, schema version, atomic write, 0600 permissions, run_id, quarantine, API key, env override, concurrent writes |
 | **Telemetry** | `test_telemetry.py` | Record, get_recent (window), get_latest, bounded buffer, multi-agent, token_count from input+output |
 | **Diagnosis** | `test_diagnosis.py` | All diagnosis types (prompt_injection, prompt_drift, cost_overrun, infinite_loop, tool_instability, memory_corruption, unknown), confidence |
+| **Multi-hypothesis diagnosis** | `test_diagnosis_multi.py` | DiagnosisResult with ranked hypotheses, fleet-wide EXTERNAL_CAUSE, deduplication, backward-compat diagnose_single, operator feedback confidence adjustment |
+| **Success-weighted healing** | `test_diagnosis_multi.py` | Default ordering, skip failed actions, reorder by global success patterns, exhaustion returns None, EXTERNAL_CAUSE policy, cross-agent immune memory, success rates, feedback storage |
 | **Healing policies** | `test_healing.py` | Policy ladder, next_action (skip failed), all diagnosis types have policies ending in RESET_AGENT |
+| **Probation validation** | `test_probation.py` | Healer.validate_probation (no baseline, insufficient data, healthy sentinel, infected sentinel), lifecycle probation states (enter, tick counting, completion, pass-to-healthy, fail-back-to-healing, execution allowed), baseline adaptation (reset, accelerate, deceleration revert, reset-then-relearn) |
+| **Lifecycle** | `test_lifecycle.py` | 8-state machine transitions, anomaly escalation (SUSPECTED → DRAINING), draining, healing, probation tick counting, exhausted state, execution blocking, history |
+| **Enforcement** | `test_enforcement.py` | NoOpEnforcement, GatewayEnforcement (mock policy engine), ProcessEnforcement (mock PID/signals), ContainerEnforcement (mock Docker/K8s), CompositeEnforcement (chained strategies) |
+| **Executor** | `test_executor.py` | SimulatedExecutor (agent state changes), GatewayExecutor (mock policy injection), ProcessExecutor (mock HTTP control API), ContainerExecutor (mock commands and fallback) |
+| **Correlator** | `test_correlator.py` | AGENT_SPECIFIC, FLEET_WIDE, PARTIAL_FLEET verdicts, mock Sentinel and TelemetryCollector |
 | **Orchestrator (integration)** | `test_orchestrator.py` | Baseline learning, latency spike → infection, quarantine → cache persist/restore, **HITL**: severe → pending, approve, reject; **auto-heal**; deviation threshold |
 | **SDK** | `test_sdk.py` | Payload construction, API key header, buffering, error callback; mocks HTTP to ingest |
 | **Gateway: Vitals** | `test_gateway_vitals.py` | System prompt extraction, tool-call counting, cost estimation, full vitals from request/response, streaming chunk extraction |
@@ -80,8 +87,9 @@ This document maps **DOCS.md** real-world behavior to test coverage and lists **
 
 ## Summary
 
-- **Unit/component tests** for detection, baseline, cache, telemetry, diagnosis, healing policies, orchestrator, gateway, and SDK are in good shape for the scenarios described in DOCS.
+- **Unit/component tests** for detection, baseline, cache, telemetry, diagnosis, healing policies, orchestrator, gateway, SDK, and the new production-readiness modules are in good shape for the scenarios described in DOCS.
 - **Covered (items 1–10 above):** ApiStore contract, dashboard HTTP (ingest, approve, heal-now, read APIs), store-backed detection, run_id isolation, restart resilience (no cache), ImmuneMemory + Healer execution, rejected → Heal now flow, LLM Gateway (vitals extraction, fingerprinting, discovery, policy engine, management API, OTEL processor).
+- **Production enforcement and lifecycle:** Multi-hypothesis diagnosis with ranked hypotheses and operator feedback, success-weighted action selection with cross-agent generalization, probation-based post-healing validation, 8-state lifecycle state machine, pluggable enforcement strategies (gateway, process, container, composite), pluggable healing executors (simulated, gateway, process, container), fleet-wide anomaly correlation, baseline adaptation (accelerate and hard-reset).
 - **Optional / not yet covered:** ChaosInjector tests; single E2E test with persistent store asserting infection_event and healing_event written; MCP proxy integration tests (requires live MCP server).
 
-**Test files:** `test_api_store.py`, `test_web_dashboard.py`, `test_store_backed.py`, `test_memory.py`, `store_helpers.py` (InMemoryStore), `test_gateway_vitals.py`, `test_gateway_fingerprint.py`, `test_gateway_discovery.py`, `test_gateway_policy.py`, `test_gateway_app.py`, `test_gateway_otel.py`, plus existing `test_*.py` for detection, baseline, cache, telemetry, diagnosis, healing, orchestrator, sdk.
+**Test files:** `test_api_store.py`, `test_web_dashboard.py`, `test_store_backed.py`, `test_memory.py`, `store_helpers.py` (InMemoryStore), `test_gateway_vitals.py`, `test_gateway_fingerprint.py`, `test_gateway_discovery.py`, `test_gateway_policy.py`, `test_gateway_app.py`, `test_gateway_otel.py`, `test_lifecycle.py`, `test_enforcement.py`, `test_executor.py`, `test_correlator.py`, `test_diagnosis_multi.py`, `test_probation.py`, plus existing `test_*.py` for detection, baseline, cache, telemetry, diagnosis, healing, orchestrator, sdk.

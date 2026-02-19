@@ -160,6 +160,7 @@ class BaselineLearner:
         self.alpha = 2.0 / (ewma_span + 1)
         self._ewma: Dict[str, _AgentEWMA] = {}
         self.baselines: Dict[str, BaselineProfile] = {}
+        self._pending_deceleration: Dict[str, tuple] = {}
         self._restore_from_cache()
 
     def _restore_from_cache(self):
@@ -200,6 +201,8 @@ class BaselineLearner:
         ph = getattr(vitals, "prompt_hash", "")
         if ph:
             ewma.prompt_hash = ph
+
+        self._check_deceleration(agent_id, ewma)
 
         if ewma.latency.count < self.min_samples:
             return None
@@ -322,3 +325,44 @@ class BaselineLearner:
         if self.store:
             return self.store.count_baselines()
         return 0
+
+    def reset_baseline(self, agent_id: str):
+        """Hard-reset: clear all EWMA state so the agent re-learns from scratch."""
+        self._ewma.pop(agent_id, None)
+        self.baselines.pop(agent_id, None)
+        if self.cache:
+            self.cache.set_baseline(agent_id, {})
+        logger.info("Baseline hard-reset for %s", agent_id)
+
+    def accelerate_learning(self, agent_id: str, ticks: int = 50):
+        """Soft-reset: temporarily increase EWMA alpha so the baseline adapts
+        faster for the next *ticks* samples, then reverts to normal alpha.
+
+        This is useful after healing — the agent's "normal" may have changed
+        (e.g. lower token usage after reducing autonomy) and we want the
+        baseline to converge quickly.
+        """
+        ewma = self._ewma.get(agent_id)
+        if ewma is None:
+            return
+        fast_alpha = min(0.3, self.alpha * 5)
+        for metric_name in ("latency", "tokens", "tools", "input_tokens",
+                            "output_tokens", "cost", "retry_rate", "error_rate"):
+            metric: _EWMAMetric = getattr(ewma, metric_name)
+            metric.alpha = fast_alpha
+        self._pending_deceleration[agent_id] = (ewma.latency.count + ticks, self.alpha)
+        logger.info("Baseline accelerated for %s (fast_alpha=%.3f for %d ticks)", agent_id, fast_alpha, ticks)
+
+    def _check_deceleration(self, agent_id: str, ewma: _AgentEWMA):
+        """Revert alpha after the accelerated-learning window expires."""
+        entry = self._pending_deceleration.get(agent_id)
+        if entry is None:
+            return
+        target_count, normal_alpha = entry
+        if ewma.latency.count >= target_count:
+            for metric_name in ("latency", "tokens", "tools", "input_tokens",
+                                "output_tokens", "cost", "retry_rate", "error_rate"):
+                metric: _EWMAMetric = getattr(ewma, metric_name)
+                metric.alpha = normal_alpha
+            del self._pending_deceleration[agent_id]
+            logger.info("Baseline alpha reverted to normal for %s", agent_id)

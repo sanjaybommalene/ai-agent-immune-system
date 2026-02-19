@@ -14,10 +14,13 @@ Environment variables:
     LLM_UPSTREAM_URL        Upstream LLM base URL (default: https://api.openai.com)
     GATEWAY_PORT            Port to listen on       (default: 4000)
     GATEWAY_POLICIES        JSON array of policy rules (optional)
+    GATEWAY_PROVIDERS       JSON object of named providers (optional)
+                            e.g. '{"azure":"https://myresource.openai.azure.com"}'
     INFLUXDB_URL / TOKEN / ORG / BUCKET   Persistence (optional)
     SERVER_API_BASE_URL     ApiStore target (optional, alternative to InfluxDB)
 """
 import asyncio
+import json as _json_mod
 import os
 import sys
 import threading
@@ -29,13 +32,17 @@ from flask_cors import CORS
 from immune_system.baseline import BaselineLearner
 from immune_system.cache import CacheManager
 from immune_system.detection import Sentinel
+from immune_system.enforcement import GatewayEnforcement
+from immune_system.lifecycle import AgentPhase, LifecycleManager
 from immune_system.logging_config import get_logger, setup_logging
+from immune_system.quarantine import QuarantineController
 from immune_system.telemetry import AgentVitals, TelemetryCollector
 
 from .discovery import DiscoveryService
 from .fingerprint import AgentFingerprinter
 from .policy import PolicyEngine
 from .proxy import LLMProxy
+from .routing import ProviderRegistry, RoutingTable
 
 logger = get_logger("gateway.app")
 
@@ -82,6 +89,17 @@ def create_app() -> Flask:
     upstream = os.getenv("LLM_UPSTREAM_URL", _DEFAULT_UPSTREAM).rstrip("/")
     logger.info("Gateway upstream: %s", upstream)
 
+    registry = ProviderRegistry(default_upstream=upstream)
+    providers_raw = os.getenv("GATEWAY_PROVIDERS", "").strip() or "{}"
+    try:
+        extra_providers = _json_mod.loads(providers_raw)
+        if isinstance(extra_providers, dict):
+            for name, url in extra_providers.items():
+                registry.register(name, url)
+    except (ValueError, TypeError):
+        logger.warning("GATEWAY_PROVIDERS env var is not valid JSON, ignoring")
+    routing = RoutingTable(registry)
+
     store = _build_store()
     cache = CacheManager()
     cache.load()
@@ -93,6 +111,10 @@ def create_app() -> Flask:
     fingerprinter = AgentFingerprinter()
     discovery = DiscoveryService()
     policy = PolicyEngine()
+
+    gateway_enforcement = GatewayEnforcement(policy_engine=policy)
+    quarantine = QuarantineController(enforcement=gateway_enforcement)
+    lifecycle = LifecycleManager()
 
     def _on_vitals(vitals_dict: dict):
         """Callback invoked by the proxy after each LLM call."""
@@ -116,11 +138,12 @@ def create_app() -> Flask:
         baseline_learner.update(vitals_dict["agent_id"], v)
 
     proxy = LLMProxy(
-        upstream_base_url=upstream,
+        routing=routing,
         fingerprinter=fingerprinter,
         discovery=discovery,
         policy=policy,
         on_vitals=_on_vitals,
+        quarantine_controller=quarantine,
     )
 
     app = Flask(__name__)
@@ -177,7 +200,12 @@ def create_app() -> Flask:
 
     @app.route("/health")
     def health():
-        return jsonify({"status": "ok", "upstream": upstream, "agents_discovered": discovery.count()})
+        return jsonify({
+            "status": "ok",
+            "upstream": upstream,
+            "providers": registry.list_providers(),
+            "agents_discovered": discovery.count(),
+        })
 
     @app.route("/api/gateway/agents")
     def gateway_agents():
@@ -253,6 +281,113 @@ def create_app() -> Flask:
             "tokens_stddev": round(bl.tokens_stddev, 1),
             "cost_mean": round(bl.cost_mean, 6),
             "tools_mean": round(bl.tools_mean, 2),
+        })
+
+    # ── Provider and routing management API ─────────────────────────────
+
+    @app.route("/api/gateway/providers", methods=["GET"])
+    def list_providers():
+        return jsonify(registry.list_providers())
+
+    @app.route("/api/gateway/providers", methods=["POST"])
+    def register_provider():
+        data = request.get_json(silent=True) or {}
+        name = (data.get("name") or "").strip()
+        url = (data.get("url") or "").strip()
+        if not name or not url:
+            return jsonify({"error": "name and url are required"}), 400
+        ok = registry.register(name, url)
+        if not ok:
+            return jsonify({"error": "Invalid provider name or URL"}), 400
+        return jsonify({"registered": True, "name": name, "url": url.rstrip("/")}), 201
+
+    @app.route("/api/gateway/providers/<name>", methods=["DELETE"])
+    def unregister_provider(name):
+        ok = registry.unregister(name)
+        if not ok:
+            reason = "Cannot remove the default provider" if name == "default" else "Provider not found"
+            return jsonify({"error": reason}), 400
+        return jsonify({"unregistered": True, "name": name})
+
+    @app.route("/api/gateway/routes", methods=["GET"])
+    def list_routes():
+        return jsonify(routing.list_routes())
+
+    @app.route("/api/gateway/routes", methods=["POST"])
+    def set_route():
+        data = request.get_json(silent=True) or {}
+        agent_id = (data.get("agent_id") or "").strip()
+        provider = (data.get("provider") or "").strip()
+        if not agent_id or not provider:
+            return jsonify({"error": "agent_id and provider are required"}), 400
+        ok = routing.set_route(agent_id, provider)
+        if not ok:
+            return jsonify({"error": f"Unknown provider: {provider}"}), 400
+        return jsonify({"routed": True, "agent_id": agent_id, "provider": provider}), 201
+
+    @app.route("/api/gateway/routes/<agent_id>", methods=["DELETE"])
+    def remove_route(agent_id):
+        ok = routing.remove_route(agent_id)
+        if not ok:
+            return jsonify({"error": "No route found for agent"}), 404
+        return jsonify({"removed": True, "agent_id": agent_id})
+
+    # ── Quarantine management API ────────────────────────────────────────
+
+    @app.route("/api/gateway/quarantine", methods=["GET"])
+    def list_quarantined():
+        agents = quarantine.get_all_quarantined()
+        return jsonify({
+            "quarantined": sorted(agents),
+            "count": len(agents),
+        })
+
+    @app.route("/api/gateway/quarantine/<agent_id>", methods=["POST"])
+    def quarantine_agent(agent_id):
+        import asyncio as _asyncio
+        reason = (request.get_json(silent=True) or {}).get("reason", "manual")
+        loop = _asyncio.new_event_loop()
+        try:
+            result = loop.run_until_complete(quarantine.quarantine_async(agent_id, reason))
+        finally:
+            loop.close()
+        lifecycle.force_drain(agent_id, reason)
+        lifecycle.complete_drain(agent_id)
+        return jsonify({
+            "agent_id": agent_id,
+            "quarantined": True,
+            "enforcement": result.success,
+            "detail": result.detail,
+        })
+
+    @app.route("/api/gateway/quarantine/<agent_id>", methods=["DELETE"])
+    def release_agent(agent_id):
+        import asyncio as _asyncio
+        loop = _asyncio.new_event_loop()
+        try:
+            result = loop.run_until_complete(quarantine.release_async(agent_id))
+        finally:
+            loop.close()
+        lifecycle.mark_healthy(agent_id, reason="manual_release")
+        return jsonify({
+            "agent_id": agent_id,
+            "quarantined": False,
+            "enforcement": result.success,
+            "detail": result.detail,
+        })
+
+    @app.route("/api/gateway/lifecycle/<agent_id>", methods=["GET"])
+    def agent_lifecycle(agent_id):
+        phase = lifecycle.get_phase(agent_id)
+        history = lifecycle.get_history(agent_id)
+        return jsonify({
+            "agent_id": agent_id,
+            "phase": phase.value,
+            "history": [
+                {"from": e.from_phase.value, "to": e.to_phase.value,
+                 "reason": e.reason, "timestamp": e.timestamp}
+                for e in history[-20:]
+            ],
         })
 
     logger.info("Gateway app created (port=%s, upstream=%s)", os.getenv("GATEWAY_PORT", _DEFAULT_PORT), upstream)

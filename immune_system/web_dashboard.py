@@ -37,6 +37,7 @@ class WebDashboard:
         self.app.route('/api/heal-all-rejected', methods=['POST'])(self.post_heal_all_rejected)
         self.app.route('/api/v1/ingest', methods=['POST'])(self.post_ingest)
         self.app.route('/api/v1/agents/register', methods=['POST'])(self.post_register_agent)
+        self.app.route('/api/feedback', methods=['POST'])(self.post_feedback)
 
     def set_loop(self, loop: asyncio.AbstractEventLoop):
         """Set the asyncio event loop so approve-healing can schedule heal from Flask thread."""
@@ -278,6 +279,23 @@ class WebDashboard:
         )
         self.orchestrator.agents[agent_id] = agent
         return jsonify({'ok': True, 'status': 'registered'})
+
+    def post_feedback(self):
+        """Record operator feedback on a past diagnosis.
+
+        POST JSON body:
+            agent_id      (required)
+            actual_cause   e.g. "false_positive", "wrong_diagnosis", "provider_outage"
+            notes          (optional)
+        """
+        data = request.get_json(silent=True) or {}
+        agent_id = data.get('agent_id')
+        if not agent_id:
+            return jsonify({'ok': False, 'error': 'agent_id is required'}), 400
+        actual_cause = data.get('actual_cause', 'unknown')
+        notes = data.get('notes', '')
+        self.orchestrator.record_feedback(agent_id, actual_cause, notes)
+        return jsonify({'ok': True, 'agent_id': agent_id, 'actual_cause': actual_cause})
 
     def get_stats(self):
         """Get overall statistics"""

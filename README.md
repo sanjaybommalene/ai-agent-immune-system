@@ -20,11 +20,16 @@ The system treats agents as managed entities with an *immune system*:
 
 - **Baseline learning:** Each agent's normal behavior (latency, tokens, input/output tokens, cost, tool calls, retries, prompt hash) is learned from **vitals** (health metrics emitted after each task, analogous to a patient's vital signs) so that anomalies are judged relative to that agent, not a single global threshold.
 - **Anomaly detection:** A sentinel compares recent vitals to the baseline and flags infections with a deviation score (in σ — standard deviations from normal baseline). Anomaly types: token spike, latency spike, tool explosion, high retry rate, input/output token spike, cost spike, prompt change, error rate spike.
-- **Containment:** Infected agents are quarantined immediately so they no longer affect the rest of the system.
+- **8-state lifecycle:** Agents progress through INITIALIZING → HEALTHY → SUSPECTED → DRAINING → QUARANTINED → HEALING → PROBATION → HEALTHY (or EXHAUSTED).  A SUSPECTED observation window prevents false-positive quarantines.  DRAINING handles in-flight work gracefully.  PROBATION validates healing with fresh vitals.  See `docs/AGENT_LIFECYCLE.md`.
+- **Pluggable enforcement:** Quarantine is enforced via real mechanisms — gateway policy injection (blocking LLM access), OS-level signals (`SIGSTOP`/`SIGCONT`), or container orchestration (`docker pause`, `kubectl scale`).  Strategies are composable and swappable.
 - **Human-in-the-loop for severe cases:** Infections above a configurable deviation threshold (default 5.0σ) require explicit Approve or Reject in the web dashboard before healing runs. Rejected agents remain quarantined until an operator chooses "Heal now" (per agent or "Heal all").
-- **Policy-driven healing:** For each diagnosis type (e.g. prompt drift, prompt injection, infinite loop, tool instability), a fixed *healing policy* defines an ordered list of actions (e.g. reset memory, rollback prompt, reduce autonomy, revoke tools, reset agent). The healer tries actions in order; immune memory records successes and failures and skips actions that have already failed for that agent and diagnosis.
+- **Multi-hypothesis diagnosis:** The diagnostician returns ranked hypotheses with confidence scores.  If healing for the primary hypothesis fails, the system falls back to the secondary hypothesis automatically.
+- **Fleet-wide correlation:** Before diagnosing an individual agent, the system checks whether many agents are exhibiting the same anomaly simultaneously.  If so, the cause is classified as external (e.g. provider outage) and unnecessary quarantines are avoided.
+- **Real healing executors:** Healing actions are carried out via pluggable executors — simulated (demo), gateway policy changes, agent control APIs, or container orchestration commands.  See `docs/AGENT_LIFECYCLE.md` §3.
+- **Success-weighted action selection:** The healing policy ladder is reordered based on global success patterns across the fleet.  Actions that have historically worked for a given diagnosis are tried first.
+- **Operator feedback loop:** Operators can label actual root causes for past diagnoses (`POST /api/feedback`), improving diagnostic accuracy over time.
 - **Restart resilience:** A local cache (`CacheManager`) persists EWMA (Exponential Weighted Moving Average) baselines, quarantine state, run identity, and API key across restarts — no cold-start delay (the period after restart where the system has to re-learn baselines before it can detect anomalies) or state loss.
-- **Adaptive learning:** Immune memory is used across the fleet so the system converges toward actions that work and avoids repeating known failures.
+- **Baseline adaptation:** After successful healing, the baseline learner accelerates its EWMA alpha so the new normal converges quickly.
 
 The web dashboard provides a single pane of glass: agent status (with model and MCP labels), pending and rejected approvals, bulk actions (Approve all, Reject all, Heal all), recent healing actions, and learned patterns.
 
@@ -114,6 +119,7 @@ flowchart LR
     subgraph gw ["LLM Gateway (:4000)"]
         FP["Fingerprinter"]
         POL["Policy Engine"]
+        RT["Router"]
         PROXY["Reverse Proxy"]
         EXT["Vitals Extractor"]
         DISC["Discovery"]
@@ -122,6 +128,7 @@ flowchart LR
     subgraph upstream ["LLM Providers"]
         OAI["OpenAI"]
         AZ["Azure OpenAI"]
+        VLLM["vLLM / Other"]
     end
 
     subgraph core ["Immune System Core"]
@@ -134,9 +141,11 @@ flowchart LR
     A2 --> FP
     A3 --> FP
     FP --> POL
-    POL --> PROXY
+    POL --> RT
+    RT --> PROXY
     PROXY --> OAI
     PROXY --> AZ
+    PROXY --> VLLM
     PROXY --> EXT
     FP --> DISC
     EXT --> TEL
@@ -272,10 +281,14 @@ flowchart TB
 | Telemetry       | `immune_system/telemetry.py` | Stores vitals per agent; when a store is configured, uses it for persistence; otherwise in-memory; provides recent window and counts for baseline and sentinel; emits OTEL metrics for export. |
 | Baseline        | `immune_system/baseline.py` | Learns EWMA (Exponential Weighted Moving Average) baselines per metric per agent after a minimum sample count (~15); persists state via cache for restart resilience. |
 | Sentinel        | `immune_system/detection.py` | Compares recent vitals to baseline; emits infection report with anomaly types and deviation (σ). |
-| Diagnostician   | `immune_system/diagnosis.py` | Maps anomaly patterns to diagnosis types (prompt drift, prompt injection, infinite loop, tool instability, memory corruption). |
-| Healer          | `immune_system/healing.py` | Holds healing policies (diagnosis → ordered actions); applies actions (reset memory, rollback prompt, reduce autonomy, revoke tools, reset agent); consults immune memory to skip failed actions. |
-| Immune memory   | `immune_system/memory.py` | Records per-agent, per-diagnosis healing outcomes; exposes failed actions and success-rate summaries; can persist via store when configured. |
-| Quarantine      | `immune_system/quarantine.py` | Tracks quarantined agent IDs; quarantine/release used by orchestrator and agent loop. |
+| Diagnostician   | `immune_system/diagnosis.py` | Multi-hypothesis root-cause analysis: maps anomaly patterns to ranked diagnosis types (prompt drift, prompt injection, infinite loop, tool instability, memory corruption, cost overrun, external cause, unknown) with confidence scores; supports operator feedback to adjust accuracy. |
+| Healer          | `immune_system/healing.py` | Holds healing policies (diagnosis → ordered actions); applies actions via pluggable executors (simulated, gateway, process, container); success-weighted action selection reorders the policy ladder using global success patterns from immune memory; probation-based post-healing validation with fresh vitals. |
+| Immune memory   | `immune_system/memory.py` | Records per-agent, per-diagnosis healing outcomes; exposes failed actions, global success/failure patterns, success-rate summaries, and operator feedback; supports cross-agent generalization for success-weighted action selection. |
+| Quarantine      | `immune_system/quarantine.py` | Tracks quarantined agent IDs with pluggable enforcement; supports async quarantine/release/drain via enforcement strategies; gateway-level request blocking. |
+| Lifecycle       | `immune_system/lifecycle.py` | 8-state agent lifecycle state machine with transition guards, event logging, and configurable thresholds (suspect ticks, drain timeout, probation ticks). |
+| Enforcement     | `immune_system/enforcement.py` | Pluggable enforcement strategies: GatewayEnforcement, ProcessEnforcement, ContainerEnforcement, CompositeEnforcement, NoOpEnforcement. |
+| Executor        | `immune_system/executor.py` | Pluggable healing executors: SimulatedExecutor, GatewayExecutor, ProcessExecutor, ContainerExecutor. |
+| Correlator      | `immune_system/correlator.py` | Fleet-wide anomaly correlation to distinguish agent-specific vs. systemic issues. |
 | Chaos           | `immune_system/chaos.py` | Injects token/tool/latency/retry-style failures for demos. |
 | InfluxStore     | `immune_system/influx_store.py` | Optional InfluxDB-backed storage for vitals, baselines, infection/quarantine/approval events, healing memory, and action log; run-scoped by `run_id`. |
 | ApiStore        | `immune_system/api_store.py` | Optional **server API**–backed store: same interface as InfluxStore but calls a remote REST API (used when immune system runs on client and server fronts InfluxDB). Set `SERVER_API_BASE_URL` to enable. |
@@ -283,13 +296,14 @@ flowchart TB
 | Python SDK      | `immune_sdk.py` | Lightweight reporter for external Python agents; wraps `POST /api/v1/ingest` with auto-registration and API key auth. |
 | Logging         | `immune_system/logging_config.py` | Structured logging: colored console or JSON format; configurable via `LOG_LEVEL` and `LOG_FORMAT`. |
 | Orchestrator    | `immune_system/orchestrator.py` | Holds all of the above; runs agent loops, sentinel loop, and chaos schedule; implements approve/reject/heal-now and approve-all/reject-all/heal-all; exposes state and actions for the dashboard; uses store for workflow state when configured. |
-| Web dashboard   | `immune_system/web_dashboard.py` | Flask app; serves UI and REST endpoints for status, agents, pending/rejected, healing log, stats; exposes `POST /api/v1/ingest` and `POST /api/v1/agents/register` for external agents; triggers healing on the orchestrator's event loop. |
+| Web dashboard   | `immune_system/web_dashboard.py` | Flask app; serves UI and REST endpoints for status, agents, pending/rejected, healing log, stats; exposes `POST /api/v1/ingest` and `POST /api/v1/agents/register` for external agents; `POST /api/feedback` for operator diagnosis feedback; triggers healing on the orchestrator's event loop. |
 | Entry point     | `main.py` | Full run (15 agents, default 1200s). Supports ApiStore, InfluxDB, or in-memory mode; configures OTEL metrics when env vars are set. |
 | Server API      | `server/app.py` | REST bridge between ApiStore clients and InfluxDB; implements all endpoints from DOCS §6. |
 | LLM Gateway     | `gateway/app.py` | Reverse proxy for OpenAI-compatible APIs; passively extracts vitals from LLM request/response pairs. |
 | Fingerprinter   | `gateway/fingerprint.py` | Derives stable agent IDs from API keys, IPs, or custom headers. |
 | Discovery       | `gateway/discovery.py` | Auto-detects and tracks agents as they appear through the gateway. |
 | Policy Engine   | `gateway/policy.py` | Enforces rate limits, model access controls, and token budgets at the proxy layer. |
+| Routing         | `gateway/routing.py` | Multi-provider routing: ProviderRegistry (allowlisted upstreams) and RoutingTable (per-agent upstream assignment). |
 | MCP Proxy       | `gateway/mcp_proxy.py` | Optional: observes MCP tool calls between agents and MCP servers. |
 | OTEL Processor  | `gateway/otel_processor.py` | Optional: converts `gen_ai.*` OTEL spans into immune-system vitals. |
 | Start scripts   | `start-local.sh`, `start-server.sh`, `start-gateway.sh`, `stop.sh` | Start infrastructure and client in local, server, or gateway mode; stop tears down containers. |
@@ -333,7 +347,7 @@ This builds and starts the full stack (InfluxDB + OTEL + Server API container), 
 ./start-gateway.sh
 ```
 
-This starts the LLM Gateway reverse proxy on port 4000 (with InfluxDB + OTEL). Point your agents at it:
+This builds and starts the LLM Gateway reverse proxy on port 4000 (with InfluxDB + OTEL). Point your agents at it:
 
 ```bash
 export OPENAI_BASE_URL=http://localhost:4000/v1
@@ -346,6 +360,16 @@ The gateway auto-discovers agents, learns baselines, and detects anomalies. Use 
 - `GET http://localhost:4000/api/gateway/agents` — discovered agents
 - `GET http://localhost:4000/api/gateway/stats` — detection stats and active anomalies
 - `GET http://localhost:4000/api/gateway/agent/{id}/vitals` — recent vitals for an agent
+- `GET http://localhost:4000/api/gateway/quarantine` — list quarantined agents
+- `POST http://localhost:4000/api/gateway/quarantine/{id}` — quarantine an agent
+- `DELETE http://localhost:4000/api/gateway/quarantine/{id}` — release an agent
+- `GET http://localhost:4000/api/gateway/lifecycle/{id}` — agent lifecycle status
+- `GET http://localhost:4000/api/gateway/providers` — list registered LLM providers
+- `POST http://localhost:4000/api/gateway/providers` — register a provider `{"name":"azure","url":"https://..."}`
+- `DELETE http://localhost:4000/api/gateway/providers/{name}` — remove a provider
+- `GET http://localhost:4000/api/gateway/routes` — list per-agent routing table
+- `POST http://localhost:4000/api/gateway/routes` — set agent route `{"agent_id":"...","provider":"azure"}`
+- `DELETE http://localhost:4000/api/gateway/routes/{agent_id}` — remove agent route
 
 ### Stopping
 
@@ -382,7 +406,8 @@ Use `RUN_DURATION_SECONDS=120` (or similar) for a short demo. Default is 1200s. 
 | `LOG_FORMAT` | `text` (colored console) or `json` for log aggregation (default: `text`). |
 | `INGEST_API_KEY` | API key for `POST /api/v1/ingest` and `/api/v1/agents/register`. If not set, auto-generated and cached in `~/.immune_cache/state.json`. |
 | `IMMUNE_CACHE_DIR` | Directory for the local state cache file. Defaults to `~/.immune_cache`. Set to a volume-mounted path in Docker/K8s. |
-| `LLM_UPSTREAM_URL` | LLM Gateway: upstream provider URL (default: `https://api.openai.com`). |
+| `LLM_UPSTREAM_URL` | LLM Gateway: default upstream provider URL (default: `https://api.openai.com`). |
+| `GATEWAY_PROVIDERS` | LLM Gateway: JSON object of named providers, e.g. `{"azure":"https://myresource.openai.azure.com","vllm":"http://localhost:8000"}`. |
 | `GATEWAY_PORT` | LLM Gateway: listen port (default: `4000`). |
 | `GATEWAY_POLICIES` | LLM Gateway: JSON array of policy rules for rate limits, model access controls. |
 | `MCP_UPSTREAM_URL` | MCP Proxy: upstream MCP server URL (default: `http://localhost:3000`). |

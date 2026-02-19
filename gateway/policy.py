@@ -149,6 +149,20 @@ class PolicyEngine:
 
         return PolicyDecision(action=PolicyAction.ALLOW)
 
+    def add_rule(self, rule: PolicyRule):
+        """Dynamically add a policy rule (e.g. from enforcement/healing)."""
+        self._rules = [r for r in self._rules if r.name != rule.name]
+        self._rules.append(rule)
+        logger.info("Policy rule added: %s (pattern=%s, action=%s)",
+                     rule.name, rule.agent_pattern, rule.action_on_violation)
+
+    def remove_rule(self, rule_name: str):
+        """Remove a policy rule by name."""
+        before = len(self._rules)
+        self._rules = [r for r in self._rules if r.name != rule_name]
+        if len(self._rules) < before:
+            logger.info("Policy rule removed: %s", rule_name)
+
     def record_usage(self, agent_id: str, tokens: int = 0):
         """Post-response accounting."""
         self._req_counter.record(agent_id)

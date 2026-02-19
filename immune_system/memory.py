@@ -1,57 +1,54 @@
 """
-Immune Memory - Learning system that remembers which healing actions work
+Immune Memory — Adaptive learning that remembers healing outcomes, learns
+which actions work globally, and supports operator feedback.
+
+Key capabilities:
+  1. **Negative learning** — never repeat failed actions for the same
+     agent + diagnosis.
+  2. **Positive learning** — prefer globally successful actions by reordering
+     the policy ladder based on cross-agent success patterns.
+  3. **Feedback storage** — record operator corrections for diagnosis accuracy.
 """
-from dataclasses import dataclass
-from typing import List, Set, Dict
-from collections import defaultdict
-from .diagnosis import DiagnosisType
-from .healing import HealingAction
+from __future__ import annotations
+
 import time
+from collections import defaultdict
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Set
+
+from .diagnosis import DiagnosisFeedback, DiagnosisType
+from .healing import HealingAction
 
 
 @dataclass
 class HealingRecord:
-    """Record of a healing attempt"""
+    """Record of a healing attempt."""
     agent_id: str
     diagnosis_type: DiagnosisType
     healing_action: HealingAction
     success: bool
     timestamp: float
-    
+
     def __str__(self):
-        status = "✅" if self.success else "❌"
-        return f"{status} {self.agent_id}: {self.healing_action.value} for {self.diagnosis_type.value}"
+        icon = "OK" if self.success else "FAIL"
+        return f"[{icon}] {self.agent_id}: {self.healing_action.value} for {self.diagnosis_type.value}"
 
 
 class ImmuneMemory:
-    """
-    Remembers healing outcomes and learns which actions work
-    
-    Key principle: NEVER repeat failed actions for the same diagnosis
-    """
-    
+    """Remembers healing outcomes and learns which actions work."""
+
     def __init__(self, store=None):
         self.store = store
-        # Store all healing records
         self.records: List[HealingRecord] = []
-        
-        # Index: (agent_id, diagnosis_type) -> [HealingRecord]
         self.by_agent_diagnosis: Dict = defaultdict(list)
-        
-        # Global learning: diagnosis_type -> successful_actions
         self.global_success_patterns: Dict[DiagnosisType, Dict[HealingAction, int]] = defaultdict(lambda: defaultdict(int))
-    
-    def record_healing(self, agent_id: str, diagnosis_type: DiagnosisType, 
-                      healing_action: HealingAction, success: bool):
-        """
-        Record outcome of a healing attempt
-        
-        Args:
-            agent_id: Agent that was healed
-            diagnosis_type: Diagnosis that was treated
-            healing_action: Action that was attempted
-            success: Whether healing succeeded
-        """
+        self.global_failure_patterns: Dict[DiagnosisType, Dict[HealingAction, int]] = defaultdict(lambda: defaultdict(int))
+        self._feedback: List[DiagnosisFeedback] = []
+
+    # ── Recording ─────────────────────────────────────────────────────
+
+    def record_healing(self, agent_id: str, diagnosis_type: DiagnosisType,
+                       healing_action: HealingAction, success: bool):
         if self.store:
             self.store.write_healing_event(
                 agent_id=agent_id,
@@ -62,40 +59,33 @@ class ImmuneMemory:
                 trigger="memory_record",
                 message=None,
             )
-            return
 
         record = HealingRecord(
             agent_id=agent_id,
             diagnosis_type=diagnosis_type,
             healing_action=healing_action,
             success=success,
-            timestamp=time.time()
+            timestamp=time.time(),
         )
-        
         self.records.append(record)
         self.by_agent_diagnosis[(agent_id, diagnosis_type)].append(record)
-        
-        # Update global learning patterns
+
         if success:
             self.global_success_patterns[diagnosis_type][healing_action] += 1
-    
+        else:
+            self.global_failure_patterns[diagnosis_type][healing_action] += 1
+
+    def record_feedback(self, feedback: DiagnosisFeedback):
+        self._feedback.append(feedback)
+
+    # ── Querying ──────────────────────────────────────────────────────
+
     def get_failed_actions(self, agent_id: str, diagnosis_type: DiagnosisType) -> Set[HealingAction]:
-        """
-        Get set of healing actions that previously FAILED for this agent + diagnosis
-        
-        This is the core of adaptive immunity: we never repeat failed cures
-        
-        Args:
-            agent_id: Agent ID
-            diagnosis_type: Diagnosis type
-        
-        Returns:
-            Set of HealingActions that failed before
-        """
+        """Actions that failed for this specific agent + diagnosis."""
         if self.store:
-            raw_actions = self.store.get_failed_healing_actions(agent_id, diagnosis_type.value)
+            raw = self.store.get_failed_healing_actions(agent_id, diagnosis_type.value)
             out = set()
-            for action in raw_actions:
+            for action in raw:
                 try:
                     out.add(HealingAction(action))
                 except ValueError:
@@ -103,70 +93,54 @@ class ImmuneMemory:
             return out
 
         records = self.by_agent_diagnosis.get((agent_id, diagnosis_type), [])
-        
-        failed_actions = set()
-        for record in records:
-            if not record.success:
-                failed_actions.add(record.healing_action)
-        
-        return failed_actions
-    
+        return {r.healing_action for r in records if not r.success}
+
     def get_successful_actions(self, diagnosis_type: DiagnosisType) -> List[HealingAction]:
-        """
-        Get healing actions that worked globally for this diagnosis type,
-        sorted by success rate
-        
-        Args:
-            diagnosis_type: Diagnosis type
-        
-        Returns:
-            List of HealingActions sorted by success count
-        """
-        success_counts = self.global_success_patterns[diagnosis_type]
-        
-        # Sort by success count
-        sorted_actions = sorted(success_counts.items(), key=lambda x: x[1], reverse=True)
-        
-        return [action for action, count in sorted_actions]
-    
+        """Actions that worked globally for this diagnosis, sorted by success count."""
+        counts = self.global_success_patterns[diagnosis_type]
+        sorted_actions = sorted(counts.items(), key=lambda x: x[1], reverse=True)
+        return [action for action, _ in sorted_actions]
+
+    def get_success_rate_for_action(self, diagnosis_type: DiagnosisType,
+                                     action: HealingAction) -> float:
+        """Success rate for a specific action+diagnosis across all agents."""
+        s = self.global_success_patterns[diagnosis_type].get(action, 0)
+        f = self.global_failure_patterns[diagnosis_type].get(action, 0)
+        total = s + f
+        return s / total if total > 0 else 0.0
+
     def get_healing_history(self, agent_id: str) -> List[HealingRecord]:
-        """Get all healing records for an agent"""
         return [r for r in self.records if r.agent_id == agent_id]
-    
+
     def get_total_healings(self) -> int:
-        """Get total number of healing attempts"""
         if self.store:
             return self.store.get_total_healings()
         return len(self.records)
-    
+
     def get_success_rate(self) -> float:
-        """Get overall healing success rate"""
         if self.store:
             return self.store.get_healing_success_rate()
         if not self.records:
             return 0.0
-        
-        successes = sum(1 for r in self.records if r.success)
-        return successes / len(self.records)
-    
+        return sum(1 for r in self.records if r.success) / len(self.records)
+
     def get_pattern_summary(self) -> Dict:
-        """Get summary of learned patterns"""
         if self.store:
             return self.store.get_healing_pattern_summary()
         summary = {}
-        
-        for diagnosis_type, actions in self.global_success_patterns.items():
+        for dtype, actions in self.global_success_patterns.items():
             if actions:
-                best_action = max(actions.items(), key=lambda x: x[1])
-                summary[diagnosis_type.value] = {
-                    'best_action': best_action[0].value,
-                    'success_count': best_action[1]
+                best = max(actions.items(), key=lambda x: x[1])
+                summary[dtype.value] = {
+                    "best_action": best[0].value,
+                    "success_count": best[1],
                 }
-        
         return summary
-    
+
     def has_learning_for(self, agent_id: str, diagnosis_type: DiagnosisType) -> bool:
-        """Check if we have any learning for this agent + diagnosis combination"""
         if self.store:
             return len(self.store.get_failed_healing_actions(agent_id, diagnosis_type.value)) > 0
         return (agent_id, diagnosis_type) in self.by_agent_diagnosis
+
+    def get_feedback_history(self) -> List[DiagnosisFeedback]:
+        return list(self._feedback)

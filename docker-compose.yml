@@ -60,6 +60,7 @@ services:
       - "${GATEWAY_PORT:-4000}:4000"
     environment:
       LLM_UPSTREAM_URL: ${LLM_UPSTREAM_URL:-https://api.openai.com}
+      GATEWAY_PROVIDERS: "${GATEWAY_PROVIDERS:-}"
       GATEWAY_PORT: "4000"
       GATEWAY_POLICIES: ${GATEWAY_POLICIES:-}
       INFLUXDB_URL: http://influxdb:8086
