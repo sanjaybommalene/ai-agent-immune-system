@@ -144,7 +144,7 @@ For each diagnosis type, actions are tried in order.  The order is **reranked** 
 The diagnostician returns **ranked hypotheses** instead of a single diagnosis.  If healing for the primary hypothesis fails, the orchestrator falls back to the next hypothesis:
 
 ```mermaid
-%%{init:{'theme':'base','themeVariables':{'primaryColor':'#E8F5E9','primaryBorderColor':'#2E7D32','lineColor':'#2E7D32','textColor':'#212121','fontSize':'13px'}}}%%
+%%{init:{'theme':'base','themeVariables':{'primaryColor':'#c5f0e9','primaryBorderColor':'#f7df05','lineColor':'#f7df05','textColor':'#f7df05','fontSize':'13px'}}}%%
 sequenceDiagram
     participant S as Sentinel
     participant C as Correlator

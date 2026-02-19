@@ -334,7 +334,7 @@ Because the gateway proxies the standard OpenAI API format (which has become the
 This diagram shows the end-to-end flow from customer agent to detection:
 
 ```mermaid
-%%{init: {'theme': 'base', 'themeVariables': {'background': '#fafafa', 'mainBkg': '#fafafa', 'actorTextColor': '#0d1117', 'actorBkg': '#e3f2fd', 'actorBorder': '#1565c0', 'actorLineColor': '#90a4ae', 'signalColor': '#0d47a1', 'signalTextColor': '#0d1117', 'labelTextColor': '#0d1117', 'loopTextColor': '#0d1117', 'noteBkgColor': '#fff9c4', 'noteTextColor': '#0d1117', 'noteBorderColor': '#f57f17', 'activationBkgColor': '#f5f5f5', 'activationBorderColor': '#90a4ae', 'sequenceNumberColor': '#ffffff'}}}%%
+%%{init: {'theme': 'base', 'themeVariables': {'background': '#fafafa', 'mainBkg': '#fafafa', 'actorTextColor': '#0d1117', 'actorBkg': '#e3f2fd', 'actorBorder': '#1565c0', 'actorLineColor': '#90a4ae', 'signalColor': '#0d47a1', 'signalTextColor': '#f7df05', 'labelTextColor': '#f7df05', 'loopTextColor': '#f7df05', 'noteBkgColor': '#fff9c4', 'noteTextColor': '#f7df05', 'noteBorderColor': '#f57f17', 'activationBkgColor': '#f5f5f5', 'activationBorderColor': '#90a4ae', 'sequenceNumberColor': '#ffffff'}}}%%
 sequenceDiagram
     participant Agent as Customer Agent
     participant GW as LLM Gateway
