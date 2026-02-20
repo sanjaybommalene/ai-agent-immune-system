@@ -32,7 +32,7 @@ class ChaosInjector:
         Inject random failures into multiple agents.
         Uses a mix of infection types; some are severe (multi-signal or extreme).
         """
-        # All infection types: (key, display_name). Severe ones produce high severity.
+        # All infection types: (key, display_name). Severe ones produce high deviation (σ).
         infection_types = [
             ("token_explosion", "TOKEN SPIKE"),
             ("tool_loop", "TOOL LOOP"),

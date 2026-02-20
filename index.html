@@ -252,7 +252,7 @@
           <li>Detects anomalies (prompt drift, token explosions, tool loops)</li>
           <li>Quarantines unhealthy agents immediately</li>
           <li>Heals using policy-driven actions</li>
-          <li>Human-in-the-loop for high-severity cases</li>
+          <li>Human-in-the-loop for high-deviation cases (≥ threshold σ)</li>
           <li>Immune memory — avoids repeating failed healing actions</li>
         </ul>
       </div>
@@ -283,7 +283,7 @@
       <div class="slide-content">
         <ul>
           <li><strong>Baseline learning</strong> — per-agent normal behavior from OTEL vitals</li>
-          <li><strong>Anomaly detection</strong> — sentinel flags infections with severity 0–10</li>
+          <li><strong>Anomaly detection</strong> — sentinel flags infections with deviation (σ) from baseline</li>
           <li><strong>Containment</strong> — infected agents quarantined immediately</li>
           <li><strong>Human-in-the-loop</strong> — severe cases require Approve/Reject</li>
           <li><strong>Policy-driven healing</strong> — ordered actions per diagnosis type</li>
@@ -330,10 +330,10 @@
         <table class="content-table">
           <tr><th>Customer Need</th><th>Immune System Solution</th></tr>
           <tr><td>Stability at scale</td><td>Per-agent baselines, anomaly detection, quarantine limits blast radius</td></tr>
-          <tr><td>Controlled remediation</td><td>Severe cases require approval; rejected agents stay quarantined until "Heal now"</td></tr>
+          <tr><td>Controlled remediation</td><td>High-deviation cases require approval; rejected agents stay quarantined until "Heal now"</td></tr>
           <tr><td>Reduced toil</td><td>Immune memory learns what works; avoids repeating failed cures</td></tr>
           <tr><td>Single pane of glass</td><td>Dashboard: agents, pending/rejected, healing history, bulk actions</td></tr>
-          <tr><td>Safe rollout</td><td>Learned baselines for new agents; human-in-the-loop for high severity</td></tr>
+          <tr><td>Safe rollout</td><td>Learned baselines for new agents; human-in-the-loop for high deviation</td></tr>
         </table>
       </div>
       <span class="slide-counter">7 / 16</span>
@@ -368,10 +368,10 @@
       <div class="diagram-box">Agent runtime (telemetry) ── vitals (OTEL) ──► Sentinel (detect) ──► Diagnostician (diagnose)
                                                 │
                                                 ▼
-                                    Quarantine ◄── Severity check
+                                    Quarantine ◄── Deviation check (σ)
                                                 │
                                                 ▼
-                                    Pending approval (severe)  or  auto-heal (mild)
+                                    Pending approval (≥ threshold σ)  or  auto-heal (&lt; threshold)
                                                 │
                                                 ▼
                                     Healer (policy ladder) + Immune memory (learning)</div>
@@ -383,10 +383,10 @@
       <h2 class="slide-title">Data Flow</h2>
       <div class="diagram-box">AGENT RUNTIME → vitals (OTEL) → TelemetryCollector + BaselineLearner
          ↓
-SENTINEL (1s loop) → compare vitals to baseline → anomalies + severity
+SENTINEL (1s loop) → compare vitals to baseline → anomalies + deviation (σ)
          ↓
-SEVERE (≥ threshold): PENDING_APPROVALS → user Approve/Reject
-MILD (&lt; threshold): Healer auto-heals → release or escalate
+High deviation (≥ threshold σ): PENDING_APPROVALS → user Approve/Reject
+Low deviation (&lt; threshold): Healer auto-heals → release or escalate
          ↓
 HEALER + IMMUNE MEMORY → policy ladder, skip failed actions, record outcomes
          ↓
@@ -403,7 +403,7 @@ WEB DASHBOARD (Flask :8090) → Approve/Reject/Heal now → schedule heal_agent<
           <tr><td>Agent runtime</td><td>agents.py</td><td>Agent types; execute on tick; return vitals (OTEL)</td></tr>
           <tr><td>Telemetry</td><td>telemetry.py</td><td>Stores vitals per agent; recent window for baseline/sentinel</td></tr>
           <tr><td>Baseline</td><td>baseline.py</td><td>Learns mean/std per metric per agent</td></tr>
-          <tr><td>Sentinel</td><td>detection.py</td><td>Compares vitals to baseline; infection + severity 0–10</td></tr>
+          <tr><td>Sentinel</td><td>detection.py</td><td>Compares vitals to baseline; infection report with deviation (σ)</td></tr>
           <tr><td>Diagnostician</td><td>diagnosis.py</td><td>Maps anomalies to diagnosis types</td></tr>
           <tr><td>Healer</td><td>healing.py</td><td>Policy ladder; applies actions; consults immune memory</td></tr>
           <tr><td>Immune memory</td><td>memory.py</td><td>Records outcomes; failed actions; success rates</td></tr>
