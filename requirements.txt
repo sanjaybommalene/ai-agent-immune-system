@@ -5,8 +5,15 @@ flask-cors>=4.0.0
 # API store (client → server when using client-deployed architecture)
 requests>=2.28.0
 
+# LLM Gateway proxy (reverse-proxy HTTP client)
+httpx>=0.27.0
+
 # InfluxDB + OpenTelemetry
 influxdb-client>=1.43.0
 opentelemetry-api>=1.28.0
 opentelemetry-sdk>=1.28.0
 opentelemetry-exporter-otlp>=1.28.0
+
+# Testing
+pytest>=8.0.0
+pytest-asyncio>=0.24.0

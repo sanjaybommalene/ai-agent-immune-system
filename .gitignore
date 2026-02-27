@@ -30,6 +30,15 @@ build/
 dist/
 *.egg-info/
 
+# Testing
+.pytest_cache/
+htmlcov/
+.coverage
+coverage.xml
+
+# Type checking
+.mypy_cache/
+
 # Jupyter Notebook
 .ipynb_checkpoints
 
