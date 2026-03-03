@@ -3,15 +3,17 @@ Telemetry Collection - Store and query agent vitals
 """
 from dataclasses import dataclass
 from typing import List, Dict, Optional
-from collections import defaultdict
+from collections import defaultdict, deque
 import time
 
 from opentelemetry import metrics
 
+_MAX_IN_MEMORY_SAMPLES = 500
+
 
 @dataclass
 class AgentVitals:
-    """Single telemetry data point"""
+    """Single telemetry data point for an agent execution."""
     timestamp: float
     agent_id: str
     agent_type: str
@@ -20,6 +22,12 @@ class AgentVitals:
     tool_calls: int
     retries: int
     success: bool
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cost: float = 0.0
+    model: str = ""
+    error_type: str = ""
+    prompt_hash: str = ""
 
 
 class TelemetryCollector:
@@ -27,8 +35,7 @@ class TelemetryCollector:
     
     def __init__(self, store=None):
         self.store = store
-        # Store telemetry per agent: {agent_id: [AgentVitals]}
-        self.data: Dict[str, List[AgentVitals]] = defaultdict(list)
+        self.data: Dict[str, deque] = defaultdict(lambda: deque(maxlen=_MAX_IN_MEMORY_SAMPLES))
         self._total_executions = 0
 
         meter = metrics.get_meter("immune-system.telemetry")
@@ -37,6 +44,9 @@ class TelemetryCollector:
         self._token_hist = meter.create_histogram("agent.execution.token_count")
         self._tool_hist = meter.create_histogram("agent.execution.tool_calls")
         self._retry_hist = meter.create_histogram("agent.execution.retries")
+        self._input_token_hist = meter.create_histogram("agent.execution.input_tokens")
+        self._output_token_hist = meter.create_histogram("agent.execution.output_tokens")
+        self._cost_hist = meter.create_histogram("agent.execution.cost")
 
     @property
     def total_executions(self) -> int:
@@ -46,15 +56,25 @@ class TelemetryCollector:
     
     def record(self, vitals_dict: Dict):
         """Record telemetry data"""
+        input_tokens = vitals_dict.get('input_tokens', 0)
+        output_tokens = vitals_dict.get('output_tokens', 0)
+        token_count = vitals_dict.get('token_count', input_tokens + output_tokens)
+
         vitals = AgentVitals(
             timestamp=vitals_dict['timestamp'],
             agent_id=vitals_dict['agent_id'],
             agent_type=vitals_dict['agent_type'],
             latency_ms=vitals_dict['latency_ms'],
-            token_count=vitals_dict['token_count'],
+            token_count=token_count,
             tool_calls=vitals_dict['tool_calls'],
             retries=vitals_dict['retries'],
-            success=vitals_dict['success']
+            success=vitals_dict['success'],
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cost=vitals_dict.get('cost', 0.0),
+            model=vitals_dict.get('model', ''),
+            error_type=vitals_dict.get('error_type', ''),
+            prompt_hash=vitals_dict.get('prompt_hash', ''),
         )
         attributes = {"agent_id": vitals.agent_id, "agent_type": vitals.agent_type}
         self._exec_counter.add(1, attributes=attributes)
@@ -62,6 +82,9 @@ class TelemetryCollector:
         self._token_hist.record(vitals.token_count, attributes=attributes)
         self._tool_hist.record(vitals.tool_calls, attributes=attributes)
         self._retry_hist.record(vitals.retries, attributes=attributes)
+        self._input_token_hist.record(vitals.input_tokens, attributes=attributes)
+        self._output_token_hist.record(vitals.output_tokens, attributes=attributes)
+        self._cost_hist.record(vitals.cost, attributes=attributes)
 
         if self.store:
             self.store.write_agent_vitals(vitals_dict)
@@ -87,7 +110,7 @@ class TelemetryCollector:
         if self.store:
             rows = self.store.get_all_agent_vitals(agent_id)
             return [AgentVitals(**row) for row in rows]
-        return self.data.get(agent_id, [])
+        return list(self.data.get(agent_id, []))
     
     def get_count(self, agent_id: str) -> int:
         """Get number of executions for an agent"""
