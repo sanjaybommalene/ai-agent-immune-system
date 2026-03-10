@@ -1,0 +1,527 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AI Agent Immune System</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=Playfair+Display:wght@600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg-dark: #0f0f12;
+      --bg-light: #faf9f7;
+      --accent: #6366f1;
+      --accent-light: #818cf8;
+      --text-dark: #1a1a1d;
+      --text-muted: #6b7280;
+      --card-bg: #ffffff;
+      --gradient-1: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      --gradient-2: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+      --gradient-3: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
+      --gradient-4: linear-gradient(135deg, #43e97b 0%, #38f9d7 100%);
+      --gradient-tech: linear-gradient(135deg, #1e3a5f 0%, #0f172a 100%);
+      --shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.15);
+      --radius: 16px;
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      font-family: 'DM Sans', -apple-system, sans-serif;
+      background: var(--bg-dark);
+      color: var(--text-dark);
+      overflow: hidden;
+      min-height: 100vh;
+    }
+
+    .presentation { width: 100vw; height: 100vh; position: relative; }
+
+    .slide {
+      position: absolute;
+      top: 0; left: 0;
+      width: 100%; height: 100%;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      align-items: center;
+      padding: 3rem 4rem;
+      opacity: 0;
+      visibility: hidden;
+      transition: opacity 0.5s ease, visibility 0.5s ease;
+    }
+
+    .slide.active { opacity: 1; visibility: visible; z-index: 1; }
+
+    .slide-title {
+      font-family: 'Playfair Display', serif;
+      font-size: clamp(2rem, 4vw, 3.5rem);
+      font-weight: 700;
+      text-align: center;
+      margin-bottom: 0.75rem;
+      line-height: 1.2;
+      letter-spacing: -0.02em;
+    }
+
+    .slide-subtitle {
+      font-size: clamp(0.9rem, 1.8vw, 1.1rem);
+      color: var(--text-muted);
+      font-weight: 500;
+      text-align: center;
+      max-width: 700px;
+    }
+
+    .slide-content {
+      width: 100%;
+      max-width: 900px;
+      margin-top: 1.5rem;
+    }
+
+    .slide-content ul { list-style: none; text-align: left; }
+
+    .slide-content li {
+      font-size: 1.1rem;
+      padding: 0.5rem 0;
+      padding-left: 1.75rem;
+      position: relative;
+      color: var(--text-dark);
+    }
+
+    .slide-content li::before {
+      content: '';
+      position: absolute;
+      left: 0; top: 50%;
+      transform: translateY(-50%);
+      width: 6px; height: 6px;
+      border-radius: 50%;
+      background: var(--accent);
+    }
+
+    .slide.theme-dark { background: var(--bg-dark); color: #fff; }
+    .slide.theme-dark .slide-title,
+    .slide.theme-dark .slide-subtitle,
+    .slide.theme-dark .slide-content li { color: #fff; }
+    .slide.theme-dark .slide-subtitle { color: rgba(255, 255, 255, 0.7); }
+
+    .slide.theme-gradient-1 { background: var(--gradient-1); color: #fff; }
+    .slide.theme-gradient-2 { background: var(--gradient-2); color: #fff; }
+    .slide.theme-gradient-3 { background: var(--gradient-3); color: #fff; }
+    .slide.theme-gradient-tech { background: var(--gradient-tech); color: #fff; }
+
+    .slide.theme-light { background: var(--bg-light); color: var(--text-dark); }
+    .slide.theme-white { background: var(--card-bg); color: var(--text-dark); box-shadow: var(--shadow); }
+
+    .slide-counter {
+      position: fixed;
+      bottom: 1.5rem; right: 1.5rem;
+      font-size: 0.8rem;
+      color: rgba(255, 255, 255, 0.6);
+      z-index: 10;
+      font-weight: 500;
+    }
+    .slide.theme-light .slide-counter,
+    .slide.theme-white .slide-counter { color: var(--text-muted); }
+
+    .nav-hint {
+      position: fixed;
+      bottom: 1.5rem; left: 50%;
+      transform: translateX(-50%);
+      font-size: 0.7rem;
+      color: rgba(255, 255, 255, 0.4);
+      z-index: 10;
+      letter-spacing: 0.05em;
+    }
+    .slide.theme-light .nav-hint,
+    .slide.theme-white .nav-hint { color: var(--text-muted); }
+
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+      gap: 1rem;
+      margin-top: 1.5rem;
+      width: 100%;
+      max-width: 700px;
+    }
+
+    .stat-card {
+      background: rgba(255, 255, 255, 0.15);
+      backdrop-filter: blur(10px);
+      padding: 1.25rem;
+      border-radius: var(--radius);
+      text-align: center;
+      border: 1px solid rgba(255, 255, 255, 0.2);
+    }
+    .slide.theme-light .stat-card,
+    .slide.theme-white .stat-card {
+      background: white;
+      border: 1px solid #e5e7eb;
+      box-shadow: var(--shadow);
+    }
+
+    .stat-number {
+      font-family: 'Playfair Display', serif;
+      font-size: 2rem;
+      font-weight: 700;
+      margin-bottom: 0.2rem;
+    }
+    .stat-label { font-size: 0.85rem; opacity: 0.9; }
+
+    .diagram-box {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.65rem;
+      line-height: 1.4;
+      background: rgba(0, 0, 0, 0.3);
+      padding: 1rem;
+      border-radius: 8px;
+      overflow: auto;
+      max-height: 55vh;
+      max-width: 95%;
+      text-align: left;
+      white-space: pre;
+      color: #e2e8f0;
+    }
+    .slide.theme-light .diagram-box,
+    .slide.theme-white .diagram-box {
+      background: #1e293b;
+      color: #e2e8f0;
+    }
+
+    .content-table {
+      width: 100%;
+      max-width: 900px;
+      border-collapse: collapse;
+      font-size: 0.85rem;
+      margin-top: 1rem;
+    }
+    .content-table th,
+    .content-table td {
+      padding: 0.6rem 0.8rem;
+      text-align: left;
+      border-bottom: 1px solid rgba(255,255,255,0.2);
+    }
+    .slide.theme-light .content-table th,
+    .slide.theme-light .content-table td,
+    .slide.theme-white .content-table th,
+    .slide.theme-white .content-table td {
+      border-color: #e5e7eb;
+    }
+    .content-table th {
+      font-weight: 600;
+      color: var(--accent);
+    }
+    .slide.theme-dark .content-table th,
+    .slide.theme-gradient-tech .content-table th { color: #818cf8; }
+
+    .code-block {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 1rem;
+      background: rgba(0, 0, 0, 0.4);
+      padding: 1rem 1.5rem;
+      border-radius: 8px;
+      margin-top: 1rem;
+      text-align: left;
+    }
+    .slide.theme-light .code-block,
+    .slide.theme-white .code-block { background: #1e293b; color: #e2e8f0; }
+
+    .slide.scrollable { justify-content: flex-start; padding-top: 2rem; }
+    .slide.scrollable .slide-content { max-height: 60vh; overflow-y: auto; }
+
+    @media (max-width: 768px) {
+      .slide { padding: 2rem; }
+      .diagram-box { font-size: 0.55rem; }
+    }
+  </style>
+</head>
+<body>
+  <div class="presentation">
+    <!-- 1. Title -->
+    <div class="slide active theme-gradient-1" data-slide="1">
+      <h1 class="slide-title">AI Agent Immune System</h1>
+      <p class="slide-subtitle">A control plane for autonomous AI agents — detect, contain, heal</p>
+      <span class="slide-counter">1 / 16</span>
+    </div>
+
+    <!-- 2. Product Overview -->
+    <div class="slide theme-light" data-slide="2">
+      <h2 class="slide-title">Product Overview</h2>
+      <p class="slide-subtitle">Continuous monitoring, anomaly detection, quarantine & policy-driven healing</p>
+      <div class="slide-content">
+        <ul>
+          <li>Monitors agent behavior in real time</li>
+          <li>Detects anomalies (prompt drift, token explosions, tool loops)</li>
+          <li>Quarantines unhealthy agents immediately</li>
+          <li>Heals using policy-driven actions</li>
+          <li>Human-in-the-loop for high-deviation cases (≥ threshold σ)</li>
+          <li>Immune memory — avoids repeating failed healing actions</li>
+        </ul>
+      </div>
+      <span class="slide-counter">2 / 16</span>
+    </div>
+
+    <!-- 3. The Problem -->
+    <div class="slide theme-white" data-slide="3">
+      <h2 class="slide-title">The Problem</h2>
+      <p class="slide-subtitle">Autonomous AI agents can exhibit unhealthy behavior</p>
+      <div class="slide-content">
+        <ul>
+          <li><strong>Prompt drift</strong> — agents deviate from intended behavior</li>
+          <li><strong>Token explosions</strong> — runaway token usage</li>
+          <li><strong>Tool-call loops</strong> — infinite retry or recursion</li>
+          <li><strong>Latency spikes</strong> — degraded performance</li>
+          <li><strong>High retry rates</strong> — repeated failures</li>
+        </ul>
+        <p style="margin-top: 1rem; font-size: 1rem; opacity: 0.9;">Without structured response, behavior cascades. Manual intervention does not scale.</p>
+      </div>
+      <span class="slide-counter">3 / 16</span>
+    </div>
+
+    <!-- 4. The Approach -->
+    <div class="slide theme-gradient-tech" data-slide="4">
+      <h2 class="slide-title">The Approach</h2>
+      <p class="slide-subtitle">Agents as managed entities with an immune system</p>
+      <div class="slide-content">
+        <ul>
+          <li><strong>Baseline learning</strong> — per-agent normal behavior from OTEL vitals</li>
+          <li><strong>Anomaly detection</strong> — sentinel flags infections with deviation (σ) from baseline</li>
+          <li><strong>Containment</strong> — infected agents quarantined immediately</li>
+          <li><strong>Human-in-the-loop</strong> — severe cases require Approve/Reject</li>
+          <li><strong>Policy-driven healing</strong> — ordered actions per diagnosis type</li>
+          <li><strong>Immune memory</strong> — skips actions that failed before</li>
+        </ul>
+      </div>
+      <span class="slide-counter">4 / 16</span>
+    </div>
+
+    <!-- 5. Use Cases -->
+    <div class="slide theme-light" data-slide="5">
+      <h2 class="slide-title">Use Cases</h2>
+      <p class="slide-subtitle">Environments with many autonomous AI workloads on shared infrastructure</p>
+      <div class="slide-content">
+        <ul>
+          <li><strong>Inference agents</strong> — different models, use cases (support, analytics, code)</li>
+          <li><strong>Agentic workflows</strong> — tools, APIs, MCP servers; can drift, loop, spike</li>
+          <li><strong>RAG & retrieval agents</strong> — distinct baselines for token/tool usage</li>
+        </ul>
+        <p style="margin-top: 1rem; font-size: 1rem;">Operators need to detect misbehavior early, contain impact, restore agents without scaling manual intervention.</p>
+      </div>
+      <span class="slide-counter">5 / 16</span>
+    </div>
+
+    <!-- 6. Cisco AI PODs Example -->
+    <div class="slide theme-white" data-slide="6">
+      <h2 class="slide-title">Example: Cisco AI PODs</h2>
+      <p class="slide-subtitle">Pre-validated AI infrastructure for agentic AI at scale</p>
+      <div class="slide-content">
+        <ul>
+          <li>Cisco UCS, Nexus, NVIDIA AI Enterprise, Red Hat OpenShift</li>
+          <li>Full AI lifecycle: training, fine-tuning, RAG, inference</li>
+          <li>Secure AI Factory targets agentic AI</li>
+          <li>How the immune system helps: stability, controlled remediation, reduced toil, single pane of glass</li>
+        </ul>
+      </div>
+      <span class="slide-counter">6 / 16</span>
+    </div>
+
+    <!-- 7. How Immune System Helps (Table) -->
+    <div class="slide theme-gradient-tech scrollable" data-slide="7">
+      <h2 class="slide-title">How the Immune System Helps</h2>
+      <div class="slide-content">
+        <table class="content-table">
+          <tr><th>Customer Need</th><th>Immune System Solution</th></tr>
+          <tr><td>Stability at scale</td><td>Per-agent baselines, anomaly detection, quarantine limits blast radius</td></tr>
+          <tr><td>Controlled remediation</td><td>High-deviation cases require approval; rejected agents stay quarantined until "Heal now"</td></tr>
+          <tr><td>Reduced toil</td><td>Immune memory learns what works; avoids repeating failed cures</td></tr>
+          <tr><td>Single pane of glass</td><td>Dashboard: agents, pending/rejected, healing history, bulk actions</td></tr>
+          <tr><td>Safe rollout</td><td>Learned baselines for new agents; human-in-the-loop for high deviation</td></tr>
+        </table>
+      </div>
+      <span class="slide-counter">7 / 16</span>
+    </div>
+
+    <!-- 8. High-Level Architecture -->
+    <div class="slide theme-dark" data-slide="8">
+      <h2 class="slide-title">High-Level Architecture</h2>
+      <div class="diagram-box">┌─────────────────────────────────────────────────────────────┐
+│                      AGENT RUNTIME                           │
+│  15+ AI Agents executing tasks, emitting telemetry           │
+└─────────────────────────────────────────────────────────────┘
+                            ↓ vitals (OTEL)
+┌─────────────────────────────────────────────────────────────┐
+│                    IMMUNE SYSTEM                             │
+│  ┌─────────────┐   ┌──────────────┐   ┌────────────────┐   │
+│  │  Sentinel   │   │ Diagnostician│   │    Healer      │   │
+│  │  (Detect)   │ → │  (Diagnose)  │ → │   (Recover)    │   │
+│  └─────────────┘   └──────────────┘   └────────────────┘   │
+│         ↓                                      ↓             │
+│  ┌─────────────────┐              ┌──────────────────────┐ │
+│  │   Quarantine    │              │   Immune Memory       │ │
+│  │   (Contain)     │              │   (Learn)             │ │
+│  └─────────────────┘              └──────────────────────┘ │
+└─────────────────────────────────────────────────────────────┘</div>
+      <span class="slide-counter">8 / 16</span>
+    </div>
+
+    <!-- 9. Component Flow -->
+    <div class="slide theme-light" data-slide="9">
+      <h2 class="slide-title">Component Flow</h2>
+      <div class="diagram-box">Agent runtime (telemetry) ── vitals (OTEL) ──► Sentinel (detect) ──► Diagnostician (diagnose)
+                                                │
+                                                ▼
+                                    Quarantine ◄── Deviation check (σ)
+                                                │
+                                                ▼
+                                    Pending approval (≥ threshold σ)  or  auto-heal (&lt; threshold)
+                                                │
+                                                ▼
+                                    Healer (policy ladder) + Immune memory (learning)</div>
+      <span class="slide-counter">9 / 16</span>
+    </div>
+
+    <!-- 10. Data Flow -->
+    <div class="slide theme-gradient-tech scrollable" data-slide="10">
+      <h2 class="slide-title">Data Flow</h2>
+      <div class="diagram-box">AGENT RUNTIME → vitals (OTEL) → TelemetryCollector + BaselineLearner
+         ↓
+SENTINEL (1s loop) → compare vitals to baseline → anomalies + deviation (σ)
+         ↓
+High deviation (≥ threshold σ): PENDING_APPROVALS → user Approve/Reject
+Low deviation (&lt; threshold): Healer auto-heals → release or escalate
+         ↓
+HEALER + IMMUNE MEMORY → policy ladder, skip failed actions, record outcomes
+         ↓
+WEB DASHBOARD (Flask :8090) → Approve/Reject/Heal now → schedule heal_agent</div>
+      <span class="slide-counter">10 / 16</span>
+    </div>
+
+    <!-- 11. Components Reference -->
+    <div class="slide theme-white scrollable" data-slide="11">
+      <h2 class="slide-title">Components Reference</h2>
+      <div class="slide-content">
+        <table class="content-table">
+          <tr><th>Component</th><th>File</th><th>Responsibility</th></tr>
+          <tr><td>Agent runtime</td><td>agents.py</td><td>Agent types; execute on tick; return vitals (OTEL)</td></tr>
+          <tr><td>Telemetry</td><td>telemetry.py</td><td>Stores vitals per agent; recent window for baseline/sentinel</td></tr>
+          <tr><td>Baseline</td><td>baseline.py</td><td>Learns mean/std per metric per agent</td></tr>
+          <tr><td>Sentinel</td><td>detection.py</td><td>Compares vitals to baseline; infection report with deviation (σ)</td></tr>
+          <tr><td>Diagnostician</td><td>diagnosis.py</td><td>Maps anomalies to diagnosis types</td></tr>
+          <tr><td>Healer</td><td>healing.py</td><td>Policy ladder; applies actions; consults immune memory</td></tr>
+          <tr><td>Immune memory</td><td>memory.py</td><td>Records outcomes; failed actions; success rates</td></tr>
+          <tr><td>Quarantine</td><td>quarantine.py</td><td>Tracks quarantined agent IDs</td></tr>
+          <tr><td>Orchestrator</td><td>orchestrator.py</td><td>Runs loops; approve/reject/heal-now; exposes state</td></tr>
+          <tr><td>Web dashboard</td><td>web_dashboard.py</td><td>Flask UI; REST; triggers healing</td></tr>
+        </table>
+      </div>
+      <span class="slide-counter">11 / 16</span>
+    </div>
+
+    <!-- 12. Concurrency Model -->
+    <div class="slide theme-light" data-slide="12">
+      <h2 class="slide-title">Concurrency Model</h2>
+      <div class="slide-content">
+        <ul>
+          <li><strong>Orchestrator</strong> — one asyncio event loop</li>
+          <li><strong>Agent loops</strong> — one async task per agent, 1s tick; execute or skip if quarantined</li>
+          <li><strong>Sentinel loop</strong> — 1s; detect infections; quarantine; pending or auto-heal</li>
+          <li><strong>Web dashboard</strong> — separate thread (Flask); schedules heal_agent via run_coroutine_threadsafe</li>
+          <li><strong>Thread safety</strong> — shared lock for pending/rejected/healing log</li>
+        </ul>
+      </div>
+      <span class="slide-counter">12 / 16</span>
+    </div>
+
+    <!-- 13. Dashboard -->
+    <div class="slide theme-gradient-3" data-slide="13">
+      <h2 class="slide-title">Dashboard</h2>
+      <p class="slide-subtitle">Single pane of glass — http://localhost:8090</p>
+      <div class="slide-content">
+        <ul>
+          <li><strong>Stats</strong> — agents, executions, infections, healed, success rate</li>
+          <li><strong>Pending approvals</strong> — Approve / Reject per item or bulk</li>
+          <li><strong>Rejected healings</strong> — Heal now per item or Heal all</li>
+          <li><strong>Agent Status Grid</strong> — name, model, MCP, status; Approve/Reject/Heal on card</li>
+          <li><strong>Recent Healing Actions</strong> — timeline of approvals, rejections, attempts</li>
+          <li><strong>Learned Patterns</strong> — which actions work for which diagnoses</li>
+        </ul>
+      </div>
+      <span class="slide-counter">13 / 16</span>
+    </div>
+
+    <!-- 14. Behavior Summary -->
+    <div class="slide theme-white" data-slide="14">
+      <h2 class="slide-title">Behavior Summary</h2>
+      <div class="slide-content">
+        <ul>
+          <li><strong>Severity</strong> — 0–10 from deviation; higher = larger anomaly</li>
+          <li><strong>Severe</strong> — ≥ threshold → pending approval; no heal until Approve</li>
+          <li><strong>Rejected</strong> — stays quarantined; Heal now to start healing</li>
+          <li><strong>Auto-heal</strong> — &lt; threshold → immediate heal via policy + immune memory</li>
+          <li><strong>Policy</strong> — ordered actions per diagnosis; immune memory skips failed</li>
+        </ul>
+      </div>
+      <span class="slide-counter">14 / 16</span>
+    </div>
+
+    <!-- 15. Setup & Run -->
+    <div class="slide theme-dark" data-slide="15">
+      <h2 class="slide-title">Setup & Run</h2>
+      <div class="code-block">python3 -m venv venv
+source venv/bin/activate   # Windows: venv\Scripts\activate
+pip install -r requirements.txt
+python main.py</div>
+      <p class="slide-subtitle" style="margin-top: 1rem;">Open http://localhost:8090 — Dashboard refreshes every 1s</p>
+      <p class="slide-subtitle" style="font-size: 0.9rem;">Python 3.8+ • flask, flask-cors</p>
+      <span class="slide-counter">15 / 16</span>
+    </div>
+
+    <!-- 16. Thank You -->
+    <div class="slide theme-gradient-1" data-slide="16">
+      <h1 class="slide-title">Thank You</h1>
+      <p class="slide-subtitle">AI Agent Immune System — Detect, Contain, Heal</p>
+      <span class="slide-counter">16 / 16</span>
+    </div>
+  </div>
+
+  <div class="nav-hint">← → Arrow keys or click to navigate</div>
+
+  <script>
+    const slides = document.querySelectorAll('.slide');
+    const totalSlides = slides.length;
+    let currentSlide = 0;
+
+    function showSlide(index) {
+      slides.forEach((slide, i) => {
+        slide.classList.toggle('active', i === index);
+        const counter = slide.querySelector('.slide-counter');
+        if (counter) counter.textContent = `${index + 1} / ${totalSlides}`;
+      });
+      currentSlide = index;
+    }
+
+    function nextSlide() {
+      showSlide((currentSlide + 1) % totalSlides);
+    }
+
+    function prevSlide() {
+      showSlide((currentSlide - 1 + totalSlides) % totalSlides);
+    }
+
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'ArrowRight' || e.key === ' ') {
+        e.preventDefault();
+        nextSlide();
+      } else if (e.key === 'ArrowLeft') {
+        e.preventDefault();
+        prevSlide();
+      }
+    });
+
+    document.querySelector('.presentation').addEventListener('click', (e) => {
+      if (e.clientX > window.innerWidth / 2) nextSlide();
+      else prevSlide();
+    });
+
+    showSlide(0);
+  </script>
+</body>
+</html>
